@@ -246,7 +246,7 @@ def _propagate_future_pad(processed_future: Optional[Dict[str, Any]], original_f
 def my_prepare_images(self, batch):
     """Custom image preprocessing for experiments; replace policy.prepare_images with this when needed."""
 
-    # viz_dir = Path("/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/temp")
+    # viz_dir = Path("")
     # viz_dir.mkdir(parents=True, exist_ok=True)
 
     # def _save_debug(tensor: torch.Tensor, name: str) -> None:
@@ -542,7 +542,7 @@ def train(cfg: TrainWithCriticPipelineConfig):
     logging.info(pformat(cfg_dict))
     logging.info(pformat(cfg.to_dict()))
     local_config_path = Path(
-        "/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/temp/local_train_qc_test_offline_config.json"
+        ""
     )
     import json
     with open(local_config_path, "w", encoding="utf-8") as f:

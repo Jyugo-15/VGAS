@@ -35,8 +35,8 @@ from smolvla_qchunk.eval import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate SmolVLA policy with optional critic augmentation")
-    parser.add_argument("--policy-path", default= "/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/q_only_single_suit_pretrained_policy_10_20251120_002752/checkpoints/008000/pretrained_model",type=Path, help="Policy checkpoint directory (pretrained_model)")
-    parser.add_argument("--critic-state",  type=Path, default="/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/q_only_single_suit_pretrained_policy_10_20251120_002752/checkpoints/008000/critic_pretrained_model/last.ckpt", help="Path to critic_state.pt")
+    parser.add_argument("--policy-path", default= "",type=Path, help="Policy checkpoint directory (pretrained_model)")
+    parser.add_argument("--critic-state",  type=Path, default="", help="Path to critic_state.pt")
     parser.add_argument("--use-current-critic",  type=bool, default=False, help="Path to critic_state.pt")
     parser.add_argument("--env-type", type=str, default="libero")
     env_task_group = parser.add_mutually_exclusive_group()

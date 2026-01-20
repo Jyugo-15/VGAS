@@ -300,7 +300,7 @@ class ValueQueryHead(nn.Module):
         augmented_embs, aug_pad_masks, aug_att_masks = self._append_query_token_my(prefix_embs, pad_masks, att_masks) ##直接插入
         att_2d_masks = make_att_2d_masks(aug_pad_masks, aug_att_masks)
         # Debug dump of mask tensors for inspection.
-        debug_dir = Path("/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/temp")
+        debug_dir = Path("")
         debug_dir.mkdir(parents=True, exist_ok=True)
         timestamp = int(time.time() * 1000)
 

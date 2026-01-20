@@ -351,13 +351,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--root",
         type=Path,
-        default="/home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_split/libero_object_with_rewards",
+        default="",
         help="Local dataset root (e.g. /path/to/libero_object_with_rewards).",
     )
     parser.add_argument(
         "--repo-id",
         type=str,
-        default="/home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_split/libero_object_with_rewards",
+        default="",
         help="Optional repo id override (defaults to dataset folder name).",
     )
     parser.add_argument(

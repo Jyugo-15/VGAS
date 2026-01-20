@@ -60,19 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute similarity between GT actions and best-of-n SmolVLA samples."
     )
-    #official path                    /home/chanxu/Data/workplace/vla_exp/lerobot/models/smolvla_libero 
-    #mix_task_suit_fewshot            /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/offline_qc_target_discount_few_shot_full_data_20251117_233140/checkpoints/010000/pretrained_model 
-    #object_few_shot                  /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/11.23/q_agg_min_layer_2_crit_lm_per_head_mean/checkpoints/010000/pretrained_model       
-    parser.add_argument("--policy-path", type=Path, default="/home/chanxu/Data/workplace/vla_exp/lerobot/outputs/train/my_smolvla_new_5_shot/checkpoints/005000/pretrained_model", help="SmolVLA pretrained checkpoint directory.")
+  
+    parser.add_argument("--policy-path", type=Path, default="", help="SmolVLA pretrained checkpoint directory.")
     #
-    #official path critic             /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/offline_qc_target_discount_few_shot_full_data_20251117_233140/checkpoints/010000/critic_pretrained_model/last.ckpt
-    #mix_task_suit_fewshot            /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/q_only_single_suit_pretrained_policy_10_20251120_002752/checkpoints/010000/critic_pretrained_model/last.ckpt
-    #object_few_shot                  /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/11.23/q_agg_mean_layer_2_crit_lm_mse/checkpoints/010000/critic_pretrained_model/last.ckpt
-    # #                               /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/11.23/q_agg_mean_layer_2_crit_lm_per_head_mean/checkpoints/010000/critic_pretrained_model/last.ckpt       
-    # #                               /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/11.23/q_agg_min_layer_2_crit_lm_per_head_mean/checkpoints/010000/critic_pretrained_model/last.ckpt
-    # #                               /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/11.23/q_agg_min_layer_4_crit_lm_per_head_mean/checkpoints/010000/critic_pretrained_model/last.ckpt
+   
     parser.add_argument(
-        "--critic-state", type=Path, default="/home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/12.06/calql_fusion_no_query_5000_obj_chage_dis_aggtest/checkpoints/005000/critic_pretrained_model/last.ckpt", help="Critic checkpoint dir or file (optional)."
+        "--critic-state", type=Path, default="", help="Critic checkpoint dir or file (optional)."
     )
     parser.add_argument(
         "--output-json",
@@ -81,15 +74,11 @@ def parse_args() -> argparse.Namespace:
         help="Where to save aggregate metrics.",
     )
 
-    #全数据                           /home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero
-    #object-fewshot                  /home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_with_rewards_5shot/libero_object
-    #object-full                     /home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_split/libero_object
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default="/home/chanxu/Data/workplace/vla_exp/lerobot/dataset_news/HF_LIBERO_5SHORT/libero_object",
-        # /home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_split/libero_object
-        # /home/chanxu/Data/workplace/vla_exp/lerobot/dataset_news/HF_LIBERO_5SHORT/libero_object
+        default="",
+
         help="Local LeRobot dataset root (same format used for training).",
     )
     parser.add_argument("--dataset-repo-id", type=str, default="libero_object", help="Dataset repo id/name.")

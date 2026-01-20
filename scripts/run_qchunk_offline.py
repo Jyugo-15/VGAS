@@ -10,19 +10,12 @@ from pprint import pformat
 import sys
 from typing import Optional
 
-# official ckpt /home/chanxu/Data/workplace/vla_exp/lerobot/models/smolvla_libero
-# my train policy /home/chanxu/Data/workplace/vla_exp/lerobot/outputs/train/my_smolvla_20251010_182053/checkpoints/011000/pretrained_model
-# pretrain policy /home/chanxu/Data/workplace/vla_exp/lerobot/models/smolvla_base_fix
-# merge 5 shot /home/chanxu/Data/workplace/vla_exp/smolvla_qchunk/outputs/train/offline_qc_target_discount_few_shot_full_data_20251117_233140/checkpoints/010000/pretrained_model
-
 
 DEFAULT_POLICY_PATH = Path(
-    "/home/chanxu/Data/workplace/vla_exp/lerobot/outputs/train/my_smolvla_new_5_shot/checkpoints/005000/pretrained_model"
+    ""
 )
 
-# 全数据集add reward /home/chanxu/Data/workplace/vla_exp/lerobot/dataset/HFlibero_AR
-# 全数据集 fewshot add reward  /data/chanxu/workplace/vla_exp/lerobot/dataset/HFlibero_with_rewards/merged
-DEFAULT_DATASET_ROOT = Path("/home/chanxu/Data/workplace/vla_exp/lerobot/dataset_news/HF_LIBERO_5SHORT/libero_object")
+DEFAULT_DATASET_ROOT = Path("")
 DEFAULT_DATASET_REPO_ID = "libero_object"
 DEFAULT_JOB_NAME: Optional[str] = None
 DEFAULT_WANDB_PROJECT = "my_project"
@@ -68,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Train SmolVLA with QC critic augmentation.")
     parser.add_argument("--policy-path", type=Path, default=DEFAULT_POLICY_PATH, help="Pretrained checkpoint to finetune.")
-    parser.add_argument("--policy-config", type=Path, default= None, help="Optional SmolVLA config.json to load (defaults to <policy-path>/config.json).") #"/home/chanxu/Data/workplace/vla_exp/lerobot/models/smolvla_libero/config.json"
+    parser.add_argument("--policy-config", type=Path, default= None, help="Optional SmolVLA config.json to load (defaults to <policy-path>/config.json).") 
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT, help="Local dataset root if using local storage.")
     parser.add_argument("--dataset-repo-id", type=str, default=DEFAULT_DATASET_REPO_ID, help="LeRobot dataset repo identifier.")
     parser.add_argument("--episodes", type=int, nargs="+", default=None, help="Optional subset of episode indices.")
