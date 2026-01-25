@@ -27,7 +27,6 @@ from types import MethodType
 import json
 
 import torch
-from torchvision.utils import save_image
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
@@ -41,13 +40,11 @@ from lerobot.datasets.utils import cycle
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.envs.factory import make_env
-from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.constants import (
     ACTION,
     DONE,
@@ -61,7 +58,6 @@ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
-    get_step_identifier,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
@@ -121,8 +117,8 @@ class CriticConfig:
     ood_mix_alpha_low: float = 0.3
     ood_mix_alpha_high: float = 0.7
     debug_mix_dist: bool = False
-    use_pairwise_ood_loss: bool = False
-    pairwise_ood_loss_weight: float = 1.0
+    loss_anchor_weight: float = 1.0
+    loss_rank_weight: float = 1.0
     num_query_token: int = 16
     critic_type: str = "mlp"  # {"mlp", "q_chunk_former"}
     vqh_num_backbone_layers: int = 2
@@ -539,74 +535,7 @@ def my_prepare_images(self, batch):
         img_masks.append(mask)
     return images, img_masks
 
-
-# def encode_policy_observations_test( # 封装数据增强以及是否使用vlm backbone提取特征
-#     policy: PreTrainedPolicy,
-#     batch: Dict[str, torch.Tensor],
-#     use_data_augmentations: bool = False,
-#     use_vlm_backbone_encode: bool = True,
-# ) -> PolicyEmbeddings:
-#     """Encode observations via the SmolVLA backbone, detached from gradients."""
-#     # 增加数据增强 目的是训练数据偏少的情况下容易过拟合
-#     training = policy.training
-#     policy.eval()
-#     processed_batch = policy._prepare_batch({k: v for k, v in batch.items()})
-#     old = policy.prepare_images
-#     try:
-#         if use_data_augmentations:
-#             policy.prepare_images = MethodType(my_prepare_images, policy)
-#         images, img_masks = policy.prepare_images(processed_batch)
-#     finally:
-#         policy.prepare_images = old
-
-#     state = policy.prepare_state(processed_batch)
-#     lang_tokens = processed_batch[f"{OBS_LANGUAGE_TOKENS}"]
-#     lang_masks = processed_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-
-#     prefix_embs, pad_masks, att_masks = policy.model.embed_prefix(
-#         images, img_masks, lang_tokens, lang_masks, state=state
-#     )
-#     att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-#     position_ids = torch.cumsum(pad_masks, dim=1) - 1
-#     # ******
-#     if use_vlm_backbone_encode:
-#         outputs_embeds, _ = policy.model.vlm_with_expert.forward(
-#             attention_mask=att_2d_masks,
-#             position_ids=position_ids,
-#             past_key_values=None,
-#             inputs_embeds=[prefix_embs, None],
-#             use_cache=False,
-#             fill_kv_cache=True,
-#         )
-
-#         prefix_outputs = outputs_embeds[0].to(torch.float32)
-#     else:
-#         prefix_outputs = prefix_embs
-#     pad_mask_bool = pad_masks.bool()
-#     att_mask_bool = att_masks.bool()
-
-#     def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-#         mask = mask.unsqueeze(-1).to(tensor.dtype)
-#         summed = (tensor * mask).sum(dim=1)
-#         denom = mask.sum(dim=1).clamp_min(1.0)
-#         return summed / denom
-
-#     content_mask = (~att_mask_bool) & pad_mask_bool
-#     state_mask = att_mask_bool & pad_mask_bool
-
-#     img_lang_emb = masked_mean(prefix_outputs, content_mask)
-#     state_emb = masked_mean(prefix_outputs, state_mask)
-#     embedding = torch.cat([img_lang_emb, state_emb], dim=-1)
-#     policy.train(training)
-#     return PolicyEmbeddings(
-#         pooled=embedding.detach(),
-#         prefix_outs=prefix_outputs.detach(),
-#         pad_masks=pad_masks.detach(),
-#         att_masks=att_masks.detach(),
-#     )
-
-
-def encode_policy_observations(policy: PreTrainedPolicy, batch: Dict[str, torch.Tensor]) -> PolicyEmbeddings:
+def encode_policy_observations(policy: PreTrainedPolicy, batch: Dict[str, torch.Tensor], use_vlm_backbone_encode: bool = True) -> PolicyEmbeddings:
     """Encode observations via the SmolVLA backbone, detached from gradients."""
 
     training = policy.training
@@ -623,16 +552,19 @@ def encode_policy_observations(policy: PreTrainedPolicy, batch: Dict[str, torch.
     att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
     position_ids = torch.cumsum(pad_masks, dim=1) - 1
     # ******
-    outputs_embeds, _ = policy.model.vlm_with_expert.forward(
-        attention_mask=att_2d_masks,
-        position_ids=position_ids,
-        past_key_values=None,
-        inputs_embeds=[prefix_embs, None],
-        use_cache=False,
-        fill_kv_cache=True,
-    )
+    if use_vlm_backbone_encode:
+        outputs_embeds, _ = policy.model.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+            fill_kv_cache=True,
+        )
 
-    prefix_outputs = outputs_embeds[0].to(torch.float32)
+        prefix_outputs = outputs_embeds[0].to(torch.float32)
+    else:
+        prefix_outputs = prefix_embs
     pad_mask_bool = pad_masks.bool()
     att_mask_bool = att_masks.bool()
 
@@ -769,12 +701,12 @@ def train(cfg: TrainWithCriticPipelineConfig):
     cfg_dict = cfg.to_dict()
     logging.info(pformat(cfg_dict))
     logging.info(pformat(cfg.to_dict()))
-    local_config_path = Path(
-        ""
-    )
-    import json
-    with open(local_config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg_dict, f, indent=2, sort_keys=True)
+    # local_config_path = Path(
+    #     ""
+    # )
+    # import json
+    # with open(local_config_path, "w", encoding="utf-8") as f:
+    #     json.dump(cfg_dict, f, indent=2, sort_keys=True)
     critic_only = getattr(cfg, "critic_only", False)
 
     if cfg.wandb.enable and cfg.wandb.project:
@@ -795,21 +727,14 @@ def train(cfg: TrainWithCriticPipelineConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
 
     logging.info("Creating dataset")
-    try:
-        dataset = _build_reward_augmented_dataset(cfg)
-        logging.info("Using RewardAugmentedLeRobotDataset for training.")
-    except Exception as exc:  # pragma: no cover
-        logging.warning("RewardAugmented dataset build failed (%s); falling back to default factory.", exc)
-        dataset = make_dataset(cfg)
+    
+    dataset = _build_reward_augmented_dataset(cfg)
+    logging.info("Using RewardAugmentedLeRobotDataset for training.")
+   
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
-    eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None:
-        logging.info("Creating env")
-        cfg.eval.batch_size = 3
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     logging.info("Creating policy")
     policy = make_policy(
@@ -1035,7 +960,6 @@ def train(cfg: TrainWithCriticPipelineConfig):
                 encoder_fn=lambda p, b: encode_policy_observations(
                     p,
                     b,
-                    use_data_augmentations=getattr(cfg, "use_data_augmentations", False),
                     use_vlm_backbone_encode=getattr(cfg, "use_vlm_backbone_encode", True),
                 ),
                 actor=policy,

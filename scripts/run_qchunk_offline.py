@@ -60,8 +60,9 @@ def parse_args() -> argparse.Namespace:
         raise argparse.ArgumentTypeError("Expected a boolean value.")
 
     parser = argparse.ArgumentParser(description="Train SmolVLA with QC critic augmentation.")
+    # Paths & dataset.
     parser.add_argument("--policy-path", type=Path, default=DEFAULT_POLICY_PATH, help="Pretrained checkpoint to finetune.")
-    parser.add_argument("--policy-config", type=Path, default= None, help="Optional SmolVLA config.json to load (defaults to <policy-path>/config.json).") 
+    parser.add_argument("--policy-config", type=Path, default=None, help="Optional SmolVLA config.json to load (defaults to <policy-path>/config.json).")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT, help="Local dataset root if using local storage.")
     parser.add_argument("--dataset-repo-id", type=str, default=DEFAULT_DATASET_REPO_ID, help="LeRobot dataset repo identifier.")
     parser.add_argument("--episodes", type=int, nargs="+", default=None, help="Optional subset of episode indices.")
@@ -69,36 +70,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-name", type=str, default=DEFAULT_JOB_NAME, help="Custom run name (defaults to q_agg_* auto naming when omitted).")
     parser.add_argument("--resume", action="store_true", help="Resume training from an existing checkpoint.")
     parser.add_argument("--config-path", type=Path, default=None, help=f"Path to an existing `{TRAIN_CONFIG_NAME}` when using `--resume`.")
+
+    # Training schedule & runtime.
     parser.add_argument("--steps", type=int, default=12000, help="Number of optimisation steps.")
     parser.add_argument("--batch-size", type=int, default=2, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=8, help="Number of dataloader workers.")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device for policy and data.")
+    parser.add_argument("--seed", type=int, default=1000, help="Random seed for training components.")
+    parser.add_argument("--log-interval", type=int, default=10, help="Logging frequency in steps.")
+    parser.add_argument("--checkpoint-interval", type=int, default=1000, help="Checkpoint frequency in steps.")
+    parser.add_argument("--eval-freq", type=int, default=0, help="Evaluation frequency during training (0 disables).")
+    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision.")
+    parser.add_argument("--streaming", action="store_true", help="Enable streaming dataset loading mode.")
+    parser.add_argument("--expert-width-multiplier", type=float, default=None, help="Width multiplier for the LM/expert layers (must match checkpoint).")
+    parser.add_argument("--disable-save-checkpoint", action="store_true", help="Disable checkpoint saving even if LeRobot would normally save.")
+
+    # Policy chunking & rollout shapes.
     parser.add_argument("--chunk-size", type=int, default=32, help="Action chunk size for SmolVLA.")
     parser.add_argument("--n-action-steps", type=int, default=20, help="Number of supervised action steps.")
     parser.add_argument("--q-chunk-len", type=int, default=32, help="Critic/future-observation chunk length (defaults to --n-action-steps).")
     parser.add_argument("--discount", type=float, default=None, help="Discount factor (used for critic and mc returns).")
     parser.add_argument("--obs-steps", type=int, default=1, help="Number of observation steps provided to the model.")
-    parser.add_argument("--log-interval", type=int, default=10, help="Logging frequency in steps.")
-    parser.add_argument("--checkpoint-interval", type=int, default=1000, help="Checkpoint frequency in steps.")
-    parser.add_argument("--eval-freq", type=int, default=0, help="Evaluation frequency during training (0 disables).")
-    parser.add_argument("--seed", type=int, default=1000, help="Random seed for training components.")
-    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision.")
-    parser.add_argument("--streaming", action="store_true", help="Enable streaming dataset loading mode.")
-    parser.add_argument("--expert-width-multiplier", type=float, default=None, help="Width multiplier for the LM/expert layers (must match checkpoint).")
-    parser.add_argument("--disable-save-checkpoint", action="store_true", help="Disable checkpoint saving even if LeRobot would normally save.")
-    
-    parser.add_argument("--use-data-augmentations",default=False, type=bool, help="Enable or disable visual data augmentations in encode_policy_observations_test.")
-    parser.add_argument("--use-vlm-backbone-encode",default=True,help="Pass embeddings through VLM backbone encode in encode_policy_observations_test.",)
-    
+
+    # Encoding/augmentation toggles.
+    parser.add_argument("--use-data-augmentations", default=False, type=bool, help="Enable or disable visual data augmentations in encode_policy_observations_test.")
+    parser.add_argument("--use-vlm-backbone-encode", default=True, help="Pass embeddings through VLM backbone encode in encode_policy_observations_test.")
     parser.add_argument("--load-vlm-weights", default=True, type=bool, help="Load the VLM backbone weights.")
     parser.add_argument("--unfreeze-vision-encoder", action="store_true", help="Finetune the vision encoder layers.")
     parser.add_argument("--train-full-model", action="store_true", help="Disable expert-only training.")
     parser.add_argument("--push-to-hub", action="store_true", help="Push checkpoints to the Hugging Face Hub.")
     parser.add_argument("--policy-repo-id", type=str, default=None, help="Hub repo id when pushing to the hub.")
+
+    # W&B.
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", type=str, default=DEFAULT_WANDB_PROJECT, help="W&B project name.")
-    parser.add_argument("--critic-only", dest="critic_only", action="store_true", help="Only train the critic (skip policy updates).")
-    parser.set_defaults(critic_only=True)
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/organization.")
     parser.add_argument("--wandb-mode", type=str, default="disabled", choices=["online", "offline", "disabled"], help="W&B logging mode override.")
     parser.add_argument("--wandb-notes", type=str, default=None, help="Optional notes attached to W&B run.")
@@ -107,29 +112,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-upload-code", dest="wandb_upload_code", action="store_true", help="Upload repository source code to W&B once at run start.")
     parser.add_argument("--no-wandb-upload-code", dest="wandb_upload_code", action="store_false", help="Disable uploading source code artifacts to W&B.")
     parser.set_defaults(wandb_upload_policy=False, wandb_upload_code=False)
-    parser.add_argument("--use-calql", type=str2bool, default=False, help="Enable CalQL regularization in critic (True/False).")
-    parser.add_argument("--use-ood-reg", type=str2bool, default=True, help="Enable explicit OOD penalty regularization.")
-    parser.add_argument("--ood-alpha", type=float, default=2.0, help="Weight for OOD regularization term.")
-    parser.add_argument("--dist-penalty-beta", type=float, default=5, help="Slope for distance-based OOD target.")
-    parser.add_argument("--ood-warmup-steps", type=int, default=0, help="Warmup steps before enabling OOD regularization.")
-    parser.add_argument(
-        "--ood-include-current-actions",
-        type=str2bool,
-        default=True,
-        help="Include policy current actions when building OOD samples.",
-    )
-    parser.add_argument(
-        "--ood-include-random-actions",
-        type=str2bool,
-        default=False,
-        help="Include random/noise actions when building OOD samples.",
-    )
-    parser.add_argument(
-        "--ood-include-next-actions",
-        type=str2bool,
-        default=False,
-        help="Include next-state actions when building OOD samples (CalQL forces True).",
-    )
+
+    # Training mode.
+    parser.add_argument("--critic-only", dest="critic_only", action="store_true", help="Only train the critic (skip policy updates).")
+    parser.set_defaults(critic_only=True)
 
     # Environment helpers.
     parser.add_argument("--env-type", type=str, default="libero", help="Environment type to attach (use 'none' to disable, e.g. 'libero').")
@@ -140,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-episode-length", type=int, default=520, help="Episode length for Libero env.")
     parser.add_argument("--env-disable-init-states", action="store_true", help="Disable loading stored initial states for the Libero environment.")
 
-    # Critic-specific knobs (mirrors CriticConfig defaults).
+    # Critic training knobs.
     parser.add_argument("--critic-disable", default=False, help="Disable critic updates (pure BC).")
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[512, 512], help="Hidden dimensions for the critic backbone MLP.")
     parser.add_argument("--critic-lr", type=float, default=1e-4, help="Critic optimizer learning rate.")
@@ -148,76 +134,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic-weight-decay", type=float, default=1e-10, help="Weight decay applied to critic parameters.")
     parser.add_argument("--critic-discount", type=float, default=0.98, help="Discount factor for critic targets.")
     parser.add_argument("--critic-tau", type=float, default=0.005, help="Soft target update coefficient.")
-    parser.add_argument(
-        "--critic-tau-warmup",
-        type=float,
-        default=None,
-        help="Optional tau used during warmup steps before switching to --critic-tau.",
-    )
-    parser.add_argument(
-        "--critic-tau-warmup-steps",
-        type=int,
-        default=0,
-        help="Number of initial steps to use warmup tau (if provided).",
-    )
+    parser.add_argument("--critic-tau-warmup", type=float, default=None, help="Optional tau used during warmup steps before switching to --critic-tau.")
+    parser.add_argument("--critic-tau-warmup-steps", type=int, default=0, help="Number of initial steps to use warmup tau (if provided).")
     parser.add_argument("--critic-grad-clip", type=float, default=10.0, help="Gradient clipping norm for critic updates.")
-    parser.add_argument(
-        "--critic-grad-clip-warmup",
-        type=float,
-        default=None,
-        help="Optional gradient clip to use during warmup steps (uses --ood-warmup-steps as boundary).",
-    )
+    parser.add_argument("--critic-grad-clip-warmup", type=float, default=None, help="Optional gradient clip to use during warmup steps (uses --ood-warmup-steps as boundary).")
     parser.add_argument("--critic-action-samples", type=int, default=8, help="Number of candidate chunks evaluated in the best-of-n sampler.")
     parser.add_argument("--best-of-n-samples", type=int, default=None, help="Override for the number of Best-of-N samples (defaults to --critic-action-samples).")
     parser.add_argument("--critic-q-agg", type=str, default="min", choices=["mean", "min", "max"], help="Aggregation used when combining twin Q estimates.")
     parser.add_argument("--critic-att-mode", type=str, default="bi-level", choices=["causal", "bi-level"], help="Attention pattern for transformer-based critic heads.")
     parser.add_argument("--critic-temperature", type=float, default=2.0, help="Noise scale for candidate actions.")
-    parser.add_argument(
-        "--critic-mask-dropout-prob",
-        type=float,
-        default=0.5,
-        help="Dropout prob for action padding mask during critic training (0 disables).",
-    )
-    parser.add_argument(
-        "--critic-value-head-bias-enable",
-        action="store_true",
-        help="Initialize value head final-layer bias to a constant.",
-    )
-    parser.add_argument(
-        "--critic-value-head-bias-value",
-        type=float,
-        default=0.0,
-        help="Constant bias value when --critic-value-head-bias-enable is set.",
-    )
-    parser.add_argument(
-        "--critic-use-dual-noise-ood",
-        action="store_true",
-        help="Use dual-noise GT negatives (tiny + small noise) instead of truncation OOD.",
-    )
-    parser.add_argument(
-        "--critic-action-weights",
-        type=float,
-        nargs="+",
-        default=None,
-        help="Per-dimension weights for action distance in OOD penalty (length must match action dim).",
-    )
-    parser.add_argument("--cql-m-actions", type=int, default=2, help="Number of CQL samples (defaults to all best-of-n candidates).")
-    parser.add_argument("--cql-alpha", type=float, default=1.0, help="Weight for CalQL/CQL regularization term.")
-    parser.add_argument("--cql-next-noise-std", type=float, default=0.05, help="Std for CalQL next-action noise (set 0 to disable).")
-    parser.add_argument(
-        "--cql-cur-noise-std",
-        type=float,
-        default=None,
-        help="Std for CalQL current-action noise (defaults to next noise std; set 0 to disable).",
-    )
+    parser.add_argument("--critic-mask-dropout-prob", type=float, default=0.5, help="Dropout prob for action padding mask during critic training (0 disables).")
+    parser.add_argument("--critic-value-head-bias-enable", action="store_true", help="Initialize value head final-layer bias to a constant.")
+    parser.add_argument("--critic-value-head-bias-value", type=float, default=0.0, help="Constant bias value when --critic-value-head-bias-enable is set.")
+    parser.add_argument("--critic-use-dual-noise-ood", action="store_true", help="Use dual-noise GT negatives (tiny + small noise) instead of truncation OOD.")
+    parser.add_argument("--critic-action-weights", type=float, nargs="+", default=None, help="Per-dimension weights for action distance in OOD penalty (length must match action dim).")
+    parser.add_argument("--critic-warmup-steps", type=int, default=1000, help="Warmup steps for the critic learning rate.")
+    parser.add_argument("--critic-total-steps", type=int, default=12000, help="Optional total steps for critic LR scheduling (defaults to --steps).")
+    parser.add_argument("--critic-lr-final", type=float, default=2.5e-06, help="Final critic learning rate after decay (default 0, i.e. decay to zero).")
 
-    parser.add_argument(
-        "--critic-type",
-        type=str,
-        default="q_chunk_former",
-        choices=["mlp", "q_chunk_former", "my_value_query_head", "my_value_head", "value_head"],
-        help="Critic architecture to use for QC training (legacy names map to q_chunk_former).",
-    )
+    # Critic architecture.
+    parser.add_argument("--critic-type", type=str, default="q_chunk_former", choices=["mlp", "q_chunk_former"], help="Critic architecture to use for QC training (legacy names map to q_chunk_former).")
     parser.add_argument("--critic-head-type", type=str, default="transformer", choices=["mlp", "transformer"], help="Head to pair with value_query_head critics.")
     parser.add_argument("--critic-head-num-layers", type=int, default=2, help="Number of transformer layers for the critic head when applicable.")
     parser.add_argument("--critic-head-mlp-dims", type=int, nargs="+", default=None, help="MLP dimensions used inside the critic head (defaults to critic hidden dims).")
@@ -225,48 +161,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic-vqh-num-backbone-layers", type=int, default=2, help="Number of decoder layers for ValueQueryHead backbones.")
     parser.add_argument("--critic-vqh-vlm-model-name", type=str, default=None, help="Override the VLM model name used when instantiating ValueQueryHead backbones.")
     parser.add_argument("--critic-num-q-heads", type=int, default=2, help="Number of independent Q heads when using ValueQueryHead critics.")
-    parser.add_argument("--critic-loss-mode", type=str, default="per_head_mean", choices=["mse", "per_head_mean"], help="Reduction applied to critic TD errors.") # mse 对各个头求平均再做mse, per_head_mean 对 各个头先计算loss再做平均
+    parser.add_argument("--critic-loss-mode", type=str, default="per_head_mean", choices=["mse", "per_head_mean"], help="Reduction applied to critic TD errors.")
+    # Raw state fusion.
+    parser.add_argument("--use-raw-state-fusion", type=str2bool, default=True, help="Enable raw state fusion into critic action embeddings (requires observation.state).")
+    parser.add_argument("--raw-state-dim", type=int, default=8, help="Dimension of observation.state when raw state fusion is enabled.")
     # parser.add_argument("--num-query-token", type=int, default=16, help="Number of query tokens for transformer critic heads.")
-    parser.add_argument("--critic-warmup-steps", type=int, default=1000, help="Warmup steps for the critic learning rate.")
-    parser.add_argument("--critic-total-steps", type=int, default=12000, help="Optional total steps for critic LR scheduling (defaults to --steps).")
-    parser.add_argument("--critic-lr-final", type=float, default=2.5e-06, help="Final critic learning rate after decay (default 0, i.e. decay to zero).")
+    # parser.add_argument("--use-query-head", type=str2bool, dest="critic_query_head", default=False, help="Whether to use the query-based critic head (set False to use the no-query variant).")
     parser.add_argument("--critic-value-head-num-layers", type=int, default=2, help="Number of transformer layers for value_head critics.")
     parser.add_argument("--critic-value-head-mlp-dims", type=int, nargs="+", default=None, help="MLP hidden dims for value_head critics (defaults to critic hidden dims).")
     parser.add_argument("--critic-value-head-vlm-model-name", type=str, default=None, help="Override VLM model when constructing value_head critics.")
-    # parser.add_argument(
-    #     "--use-query-head",
-    #     type=str2bool,
-    #     dest="critic_query_head",
-    #     default=False,
-    #     help="Whether to use the query-based critic head (set False to use the no-query variant).",
-    # )
-    parser.add_argument(
-        "--use-raw-state-fusion",
-        type=str2bool,
-        default=True,
-        help="Enable raw state fusion into critic action embeddings (requires observation.state).",
-    )
-    parser.add_argument(
-        "--raw-state-dim",
-        type=int,
-        default=8,
-        help="Dimension of observation.state when raw state fusion is enabled.",
-    )
+
+    # CalQL & OOD regularization.
+    parser.add_argument("--use-calql", type=str2bool, default=False, help="Enable CalQL regularization in critic (True/False).")
+    parser.add_argument("--use-ood-reg", type=str2bool, default=True, help="Enable explicit OOD penalty regularization.")
+    parser.add_argument("--ood-alpha", type=float, default=2.0, help="Weight for OOD regularization term.")
+    parser.add_argument("--ood-action-source", type=str, default="erg", choices=["erg", "cql"], help="OOD action source ('erg' or 'cql').")
+    parser.add_argument("--dist-penalty-beta", type=float, default=5, help="Slope for distance-based OOD target.")
+    parser.add_argument("--dist-clamp-max", type=float, default=None, help="Optional clamp on OOD distance target.")
+    parser.add_argument("--ood-warmup-steps", type=int, default=0, help="Warmup steps before enabling OOD regularization.")
+    parser.add_argument("--ood-include-current-actions", type=str2bool, default=True, help="Include policy current actions when building OOD samples.")
+    parser.add_argument("--ood-include-random-actions", type=str2bool, default=False, help="Include random/noise actions when building OOD samples.")
+    parser.add_argument("--ood-include-next-actions", type=str2bool, default=False, help="Include next-state actions when building OOD samples (CalQL forces True).")
+    parser.add_argument("--use-ood-noise", type=str2bool, default=True, help="Add Gaussian noise to OOD actions.")
+    parser.add_argument("--use-ood-trunc", type=str2bool, default=True, help="Include truncated actions in OOD pool.")
+    parser.add_argument("--use-ood-mix", type=str2bool, default=False, help="Include mixed actions in OOD pool.")
+    parser.add_argument("--ood-noise-stds", type=float, nargs="+", default=[0.02], help="Noise stds for OOD action perturbations.")
+    parser.add_argument("--ood-mix-ratio", type=float, default=0.5, help="Fraction of mixed actions to include in OOD pool.")
+    parser.add_argument("--ood-mix-alpha-low", type=float, default=0.3, help="Low alpha for action mixing.")
+    parser.add_argument("--ood-mix-alpha-high", type=float, default=0.7, help="High alpha for action mixing.")
+    parser.add_argument("--debug-mix-dist", type=str2bool, default=False, help="Log debug stats for OOD mixing distances.")
+    parser.add_argument("--loss-anchor-weight", type=float, default=1.0, help="Weight for anchor OOD loss term.")
+    parser.add_argument("--loss-rank-weight", type=float, default=1.0, help="Weight for pairwise OOD loss term.")
+    parser.add_argument("--cql-m-actions", type=int, default=2, help="Number of CQL samples (defaults to all best-of-n candidates).")
+    parser.add_argument("--cql-alpha", type=float, default=1.0, help="Weight for CalQL/CQL regularization term.")
+    parser.add_argument("--cql-next-noise-std", type=float, default=0.05, help="Std for CalQL next-action noise (set 0 to disable).")
+    parser.add_argument("--cql-cur-noise-std", type=float, default=None, help="Std for CalQL current-action noise (defaults to next noise std; set 0 to disable).")
+
+    # Offline ranking eval.
+    parser.add_argument("--eval-ranking-freq", type=int, default=0, help="Frequency (steps) for offline critic ranking eval (0 disables).")
+    parser.add_argument("--eval-ranking-batches", type=int, default=8, help="Number of batches per ranking eval run.")
+    parser.add_argument("--eval-ranking-action-samples", type=int, default=8, help="Number of candidate actions sampled for ranking eval.")
+    parser.add_argument("--eval-ranking-batch-size", type=int, default=32, help="Batch size for ranking eval dataloader.")
+    parser.add_argument("--eval-ranking-start-step", type=int, default=0, help="First step index to start ranking eval.")
+    parser.add_argument("--eval-ranking-full-dataset-root", type=Path, default=None, help="Optional root for full dataset used in ranking eval.")
+    
+
 
     return parser.parse_args()
 
 
 def build_job_name(args: argparse.Namespace) -> str:
     # Normalize legacy aliases.
-    if args.critic_type in {"my_value_query_head", "my_value_head", "value_head"}:
-        args.critic_type = "q_chunk_former"
     if args.job_name:
         return args.job_name
-    layer_count = args.critic_value_head_num_layers if args.critic_type == "q_chunk_former" else args.critic_head_num_layers
-    base = f"q_agg_{args.critic_q_agg}_layer_{layer_count}_crit_lm_{args.critic_loss_mode}"
-    aug_tag = "aug" if getattr(args, "use_data_augmentations", True) else "noaug"
-    calql_tag = "calql" if getattr(args, "use_calql", False) else "nocalql"
-    return f"{base}_{aug_tag}_{calql_tag}"
+    
 
 
 def build_env_config(args: argparse.Namespace):
@@ -330,7 +278,7 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
         num_q_heads=args.critic_num_q_heads,
         critic_loss_mode=args.critic_loss_mode,
         att_mode=args.critic_att_mode,
-        num_query_token=args.num_query_token,
+        # num_query_token=args.num_query_token,
         value_head_num_layers=args.critic_value_head_num_layers,
         value_head_mlp_dims=value_head_mlp_dims,
         value_head_vlm_model_name=args.critic_value_head_vlm_model_name,
@@ -344,14 +292,26 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
         cql_cur_noise_std=(
             args.cql_cur_noise_std if args.cql_cur_noise_std is not None else args.cql_next_noise_std
         ),
-        use_no_query_head=not args.critic_query_head,
+        # use_no_query_head=not args.critic_query_head,
         use_ood_reg=args.use_ood_reg,
         ood_alpha=args.ood_alpha,
+        ood_action_source=args.ood_action_source,
         dist_penalty_beta=args.dist_penalty_beta,
+        dist_clamp_max=args.dist_clamp_max,
         ood_warmup_steps=args.ood_warmup_steps,
         ood_include_current_actions=args.ood_include_current_actions,
         ood_include_random_actions=args.ood_include_random_actions,
         ood_include_next_actions=args.ood_include_next_actions,
+        ood_noise_stds=tuple(args.ood_noise_stds),
+        use_ood_noise=args.use_ood_noise,
+        use_ood_trunc=args.use_ood_trunc,
+        use_ood_mix=args.use_ood_mix,
+        ood_mix_ratio=args.ood_mix_ratio,
+        ood_mix_alpha_low=args.ood_mix_alpha_low,
+        ood_mix_alpha_high=args.ood_mix_alpha_high,
+        debug_mix_dist=args.debug_mix_dist,
+        loss_anchor_weight=args.loss_anchor_weight,
+        loss_rank_weight=args.loss_rank_weight,
         use_raw_state_fusion=args.use_raw_state_fusion,
         raw_state_dim=args.raw_state_dim,
         q_chunk_len=q_chunk_len,
@@ -360,6 +320,12 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
         value_head_bias_init_enabled=args.critic_value_head_bias_enable,
         value_head_bias_init_value=args.critic_value_head_bias_value,
         use_dual_noise_ood=args.critic_use_dual_noise_ood,
+        eval_ranking_freq=args.eval_ranking_freq,
+        eval_ranking_batches=args.eval_ranking_batches,
+        eval_ranking_action_samples=args.eval_ranking_action_samples,
+        eval_ranking_batch_size=args.eval_ranking_batch_size,
+        eval_ranking_start_step=args.eval_ranking_start_step,
+        eval_ranking_full_dataset_root=str(args.eval_ranking_full_dataset_root) if args.eval_ranking_full_dataset_root else None,
     )
 
 
@@ -375,10 +341,6 @@ def build_train_config(args: argparse.Namespace) -> TrainWithCriticPipelineConfi
     q_chunk_len = args.q_chunk_len or n_action_steps
     if q_chunk_len > args.chunk_size:
         raise ValueError(f"`q_chunk_len` ({q_chunk_len}) cannot exceed `chunk_size` ({args.chunk_size}).")
-    if q_chunk_len != args.chunk_size:
-        raise ValueError(
-            f"`q_chunk_len` ({q_chunk_len}) must match `chunk_size` ({args.chunk_size}) to keep critic time spans aligned."
-        )
 
     policy_config_path = args.policy_config
     if policy_config_path is None and args.policy_path:

@@ -478,27 +478,45 @@ def compute_weighted_distance(
     ood_actions: torch.Tensor,
     pad_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    weights = getattr(trainer.cfg, "action_distance_weights", None)
-    if weights is None:
-        weights = getattr(trainer, "action_distance_weights", None)
-    if weights is None:
-        weights = [1.0] * actions.shape[-1]
-    w = torch.as_tensor(weights, device=actions.device, dtype=actions.dtype).view(1, 1, 1, -1)
-    diff = (actions - ood_actions) ** 2
-    weighted = diff * w
-    dist_per_step = weighted.sum(dim=-1)
+    pred_actions = ood_actions
+    gt_actions = actions
+    if gt_actions.ndim == 3:
+        gt_actions = gt_actions.unsqueeze(1)
+
+    diff = (pred_actions - gt_actions) ** 2
+    weights_list = getattr(trainer.cfg, "action_distance_weights", None)
+    if weights_list is None:
+        weights_list = getattr(trainer, "action_distance_weights", None)
+    if weights_list is None:
+        weights_list = [5.0, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0]
+    if isinstance(weights_list, torch.Tensor):
+        weights_tensor = weights_list.to(device=pred_actions.device, dtype=pred_actions.dtype)
+        if weights_tensor.numel() != diff.shape[-1]:
+            raise ValueError(
+                f"action_distance_weights length ({weights_tensor.numel()}) must match action dim ({diff.shape[-1]})."
+            )
+        weights = weights_tensor.view(1, 1, 1, -1)
+    else:
+        if len(weights_list) != diff.shape[-1]:
+            raise ValueError(
+                f"action_distance_weights length ({len(weights_list)}) must match action dim ({diff.shape[-1]})."
+            )
+        weights = torch.tensor(weights_list, device=pred_actions.device, dtype=pred_actions.dtype).view(1, 1, 1, -1)
+
+    dist_per_step = (diff * weights).sum(dim=-1)
     if pad_mask is not None:
         if pad_mask.ndim == 2:
             pad_mask = pad_mask.unsqueeze(1)
-        if pad_mask.shape[:3] != dist_per_step.shape:
+        if pad_mask.shape[1] != dist_per_step.shape[1]:
             pad_mask = pad_mask.expand_as(dist_per_step)
         valid_mask = ~pad_mask.bool()
-        dist_per_step = dist_per_step * valid_mask
-        valid_count = valid_mask.sum(dim=-1).clamp_min(1.0)
+        dist_masked = dist_per_step * valid_mask
+        valid_count = valid_mask.sum(dim=-1).float().clamp_min(1.0)
+        dist = dist_masked.sum(dim=-1) / valid_count
     else:
-        valid_count = torch.tensor(dist_per_step.shape[-1], device=actions.device, dtype=actions.dtype)
-    dist = dist_per_step.sum(dim=-1) / valid_count
-    return torch.sqrt(dist.clamp_min(1e-8))
+        valid_count = torch.tensor(dist_per_step.shape[-1], device=pred_actions.device, dtype=pred_actions.dtype)
+        dist = dist_per_step.sum(dim=-1) / valid_count
+    return dist
 
 
 def compute_explicit_penalty_loss(
@@ -511,101 +529,65 @@ def compute_explicit_penalty_loss(
     chunk_len = _get_q_chunk_len(trainer)
     q_batch = aggregate_q(trainer.critic(encoding, actions, action_mask=ood_payload["action_mask"], raw_state=ood_payload["raw_state"]),
                           getattr(trainer.cfg, "q_aggregation", "mean"))
-    if ood_payload.get("ood_actions") is not None:
-        ood_actions = ood_payload["ood_actions"]
-        ood_forward_mask = ood_payload.get("ood_forward_mask")
-        calc_dist_mask = ood_payload.get("calc_dist_mask")
-        num_actions = ood_actions.shape[1]
-        flat = ood_actions.view(-1, chunk_len, trainer.action_step_dim)
-        rep_encoding = encoding.repeat(num_actions)
-        raw_state_base = ood_payload.get("raw_state")
-        raw_state_base = raw_state_base.to(trainer.device)
-        raw_rep = raw_state_base.repeat_interleave(num_actions, dim=0)
-        if ood_forward_mask is not None:
-            mask_rep = ood_forward_mask.view(-1, chunk_len)
-        else:
-            mask_rep = None
-        q_ood = aggregate_q(
-            trainer.critic(rep_encoding, flat, action_mask=mask_rep, raw_state=raw_rep),
-            getattr(trainer.cfg, "q_aggregation", "mean"),
-        ).view(ood_actions.shape[0], num_actions)
+    
+    if ood_payload.get("ood_actions") is None:
+        raise ValueError("ood_payload must include 'ood_actions' for explicit penalty loss.")
+    ood_actions = ood_payload["ood_actions"]
+    ood_forward_mask = ood_payload.get("ood_forward_mask")
+    calc_dist_mask = ood_payload.get("calc_dist_mask")
+    num_actions = ood_actions.shape[1]
+    flat = ood_actions.view(-1, chunk_len, trainer.action_step_dim)
+    rep_encoding = encoding.repeat(num_actions)
+    raw_state_base = ood_payload.get("raw_state")
+    raw_state_base = raw_state_base.to(trainer.device)
+    raw_rep = raw_state_base.repeat_interleave(num_actions, dim=0)
+    if ood_forward_mask is not None:
+        mask_rep = ood_forward_mask.view(-1, chunk_len)
+    else:
+        mask_rep = None
+    q_ood_values = trainer.critic(rep_encoding, flat, action_mask=mask_rep, raw_state=raw_rep)
+    if not isinstance(q_ood_values, (list, tuple)):
+        q_ood_values = (q_ood_values,)
 
-        dist = compute_weighted_distance(trainer, actions, ood_actions, pad_mask=calc_dist_mask)
-        beta = getattr(trainer.cfg, "dist_penalty_beta", 0.5)
-        dist_clamp_max = getattr(trainer.cfg, "dist_clamp_max", None)
-        if dist_clamp_max is not None:
-            dist = torch.clamp(dist, max=float(dist_clamp_max))
-        target_ood = targets.view(-1, 1) - beta * dist
-        target_ood = target_ood.detach()
-        loss_ood = torch.mean(torch.clamp(q_ood - target_ood, min=0.0) ** 2)
-        pairwise_loss = None
-        if getattr(trainer.cfg, "use_pairwise_ood_loss", False):
-            d_diff = dist.unsqueeze(1) - dist.unsqueeze(2)
-            q_diff = q_ood.unsqueeze(2) - q_ood.unsqueeze(1)
-            target_diff = beta * d_diff
-            pairwise_loss = F.mse_loss(q_diff, target_diff)
-            weight = float(getattr(trainer.cfg, "pairwise_ood_loss_weight", 1.0))
-            loss_ood = loss_ood + weight * pairwise_loss
-
-        m_policy = int(ood_payload.get("m_policy", 0) or 0)
-        m_noise = int(ood_payload.get("m_noise", 0) or 0)
-        m_mix = int(ood_payload.get("m_mix", 0) or 0)
-        m_trunc = int(ood_payload.get("m_trunc", 0) or 0)
-        idx_trunc = m_policy + m_noise + m_mix
-        if m_policy > 0:
-            win_policy = float((q_batch.view(-1, 1) > q_ood[:, :m_policy].mean(dim=1, keepdim=True)).float().mean().item())
-        else:
-            win_policy = 0.0
-        if m_trunc > 0 and idx_trunc < q_ood.shape[1]:
-            q_trunc = q_ood[:, idx_trunc : idx_trunc + m_trunc]
-            win_trunc = float((q_batch.view(-1, 1) > q_trunc.mean(dim=1, keepdim=True)).float().mean().item())
-        else:
-            win_trunc = float((q_batch.view(-1, 1) > q_ood.max(dim=1, keepdim=True).values).float().mean().item())
-
-        metrics = {
-            "ood_loss": float(loss_ood.item()),
-            "ood_q_mean": float(q_ood.mean().item()),
-            "ood_target_mean": float(target_ood.mean().item()),
-            "win_rate/gt_vs_policy": win_policy,
-            "win_rate/gt_vs_trunc": win_trunc,
-        }
-        if pairwise_loss is not None:
-            metrics["ood_loss_pairwise_raw"] = float(pairwise_loss.item())
-        return loss_ood, metrics, q_ood
-    losses = []
-    q_ood_collect = []
-
-    def _score(act: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        flat = act.view(-1, chunk_len, trainer.action_step_dim)
-        rep_encoding = encoding.repeat(act.shape[1])
-        mask_rep = mask.view(-1, chunk_len) if mask is not None else None
-        return aggregate_q(trainer.critic(rep_encoding, flat, action_mask=mask_rep, raw_state=ood_payload["raw_state"].repeat_interleave(act.shape[1], dim=0)),
-                           getattr(trainer.cfg, "q_aggregation", "mean")).view(act.shape[0], act.shape[1], -1)
-
-    if ood_payload.get("ood_include_next", False):
-        q_next = _score(ood_payload["ood_next_actions"], ood_payload["action_mask"].unsqueeze(1).expand(-1, ood_payload["ood_next_actions"].shape[1], -1))
-        q_ood_collect.append(q_next)
-    if ood_payload.get("ood_include_current", False):
-        q_current = _score(ood_payload["ood_current_actions"], ood_payload["action_mask"].unsqueeze(1).expand(-1, ood_payload["ood_current_actions"].shape[1], -1))
-        q_ood_collect.append(q_current)
-    if ood_payload.get("ood_include_random", False) and ood_payload["ood_random_actions"] is not None:
-        q_rand = _score(ood_payload["ood_random_actions"], None)
-        q_ood_collect.append(q_rand)
-
-    if not q_ood_collect:
-        raise ValueError("No OOD actions provided for explicit penalty loss.")
-    q_ood = torch.cat(q_ood_collect, dim=1)
-
-    dist = compute_weighted_distance(trainer, actions.unsqueeze(1), ood_payload["ood_current_actions"])
+    dist = compute_weighted_distance(trainer, actions, ood_actions, pad_mask=calc_dist_mask)
     beta = getattr(trainer.cfg, "dist_penalty_beta", 0.5)
-    target_ood = targets.unsqueeze(1) - beta * dist
+    dist_clamp_max = getattr(trainer.cfg, "dist_clamp_max", 5.0)
+    if dist_clamp_max is not None:
+        dist = torch.clamp(dist, max=float(dist_clamp_max))
+    target_ood = targets.view(-1, 1) - beta * dist
     target_ood = target_ood.detach()
+    ood_losses = []
+    for q_val in q_ood_values:
+        q_view = q_val.view(ood_actions.shape[0], num_actions)
+        loss = F.huber_loss(q_view, target_ood, delta=10.0)
+        ood_losses.append(loss)
+    loss_anchor = torch.stack(ood_losses).mean()
+    loss_anchor_weight = float(getattr(trainer.cfg, "loss_anchor_weight", 1.0))
+    q_ood = aggregate_q(q_ood_values, getattr(trainer.cfg, "q_aggregation", "mean")).view(
+        ood_actions.shape[0], num_actions
+    )
+    
+    d_diff = dist.unsqueeze(1) - dist.unsqueeze(2)
+    q_diff = q_ood.unsqueeze(2) - q_ood.unsqueeze(1)
+    target_diff = beta * d_diff
+    loss_rank = F.mse_loss(q_diff, target_diff)
+    loss_rank_weight = float(getattr(trainer.cfg, "loss_rank_weight", 1.0))
+    loss_ood = loss_anchor * loss_anchor_weight + loss_rank_weight * loss_rank
 
-    q_ood_flat = q_ood.view(q_ood.shape[0], q_ood.shape[1], -1)
-    loss_ood = torch.mean(torch.clamp(q_ood_flat - target_ood, min=0.0) ** 2)
-
-    win_policy = float((q_batch > q_ood_flat.mean(dim=1)).float().mean().item())
-    win_trunc = float((q_batch > q_ood_flat.max(dim=1).values).float().mean().item())
+    m_policy = int(ood_payload.get("m_policy", 0) or 0)
+    m_noise = int(ood_payload.get("m_noise", 0) or 0)
+    m_mix = int(ood_payload.get("m_mix", 0) or 0)
+    m_trunc = int(ood_payload.get("m_trunc", 0) or 0)
+    idx_trunc = m_policy + m_noise + m_mix
+    if m_policy > 0:
+        win_policy = float((q_batch.view(-1, 1) > q_ood[:, :m_policy].mean(dim=1, keepdim=True)).float().mean().item())
+    else:
+        win_policy = 0.0
+    if m_trunc > 0 and idx_trunc < q_ood.shape[1]:
+        q_trunc = q_ood[:, idx_trunc : idx_trunc + m_trunc]
+        win_trunc = float((q_batch.view(-1, 1) > q_trunc.mean(dim=1, keepdim=True)).float().mean().item())
+    else:
+        win_trunc = float((q_batch.view(-1, 1) > q_ood.max(dim=1, keepdim=True).values).float().mean().item())
 
     metrics = {
         "ood_loss": float(loss_ood.item()),
@@ -614,4 +596,6 @@ def compute_explicit_penalty_loss(
         "win_rate/gt_vs_policy": win_policy,
         "win_rate/gt_vs_trunc": win_trunc,
     }
+    if loss_rank is not None:
+        metrics["ood_loss_pairwise_raw"] = float(loss_rank.item())
     return loss_ood, metrics, q_ood
