@@ -8,9 +8,10 @@ critic logic without going through the full training script.
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import time
-from typing import Any, Dict, Optional, Protocol, Sequence
+from typing import Any, Dict, Optional, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -20,15 +21,11 @@ from qchunk.networks import CriticBackbone
 from qchunk.critic_adapters import (
     MLPCriticAdapter,
     ValueHeadCriticAdapter,
-    ValueQueryCriticAdapter,
     PolicyEmbeddings,
 )
 from qchunk.valuequeryhead import (
     ValueHeadConfig,
-    ValueHeadCritic,
-    ValueQueryHead,
-    ValueQueryHeadConfig,
-    MYQueryValueHeadCritic,
+    Qchunk_Former,
 )
 from qchunk.critic_utils import (
     discounted_chunk_returns,
@@ -120,33 +117,15 @@ class BestOfNCriticTrainer:
         obs_dim = obs_encoding.pooled.shape[-1]
 
         critic_type = getattr(cfg, "critic_type", "mlp").lower()
+        if critic_type in {"my_value_query_head", "my_value_head", "value_head"}:
+            critic_type = "q_chunk_former"
         if critic_type == "mlp":
             backbone = CriticBackbone(obs_dim, flat_action_dim, hidden_sizes=getattr(cfg, "hidden_dims", (512, 512)))
             critic = MLPCriticAdapter(backbone).to(device)
-        elif critic_type == "value_query_head":
+        elif critic_type == "q_chunk_former":
             text_config = _get_text_config(policy)
             if text_config is None:
-                raise ValueError("ValueQueryHead critic requires access to the policy text_config.")
-            num_q_heads = getattr(cfg, "num_q_heads", 2)
-            if num_q_heads < 1:
-                raise ValueError("ValueQueryHead critic requires at least one head (num_q_heads >= 1).")
-            vqh_config = ValueQueryHeadConfig(
-                chunk_size=chunk_size,
-                action_dim=action_step_dim,
-                num_backbone_layers=getattr(cfg, "vqh_num_backbone_layers", 2),
-                critic_hidden_dims=getattr(cfg, "vqh_hidden_dims", (512, 512)),
-                vlm_model_name=getattr(cfg, "vqh_vlm_model_name", None),
-                head_type=getattr(cfg, "head_type", "mlp"),
-                head_num_layers=getattr(cfg, "head_num_layers", 2),
-                head_mlp_dims=getattr(cfg, "head_mlp_dims", (512, 512)),
-                att_mode=getattr(cfg, "att_mode", "causal"),
-            )
-            heads = [ValueQueryHead(vqh_config, text_config=text_config) for _ in range(num_q_heads)]
-            critic = ValueQueryCriticAdapter(heads).to(device)
-        elif critic_type == "value_head":
-            text_config = _get_text_config(policy)
-            if text_config is None:
-                raise ValueError("ValueHead critic requires access to the policy text_config.")
+                raise ValueError("QChunk Former critic requires access to the policy text_config.")
             vh_config = ValueHeadConfig(
                 chunk_size=chunk_size,
                 action_dim=action_step_dim,
@@ -154,23 +133,6 @@ class BestOfNCriticTrainer:
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),
-            )
-            head = ValueHeadCritic(vh_config, text_config=text_config)
-            critic = ValueHeadCriticAdapter(head).to(device)
-        elif critic_type == "my_value_query_head":
-            text_config = _get_text_config(policy)
-            if text_config is None:
-                raise ValueError("MY ValueQueryHead critic requires access to the policy text_config.")
-            use_no_query_head = getattr(cfg, "use_no_query_head", False)
-
-            vh_config = ValueHeadConfig(
-                chunk_size=chunk_size,
-                action_dim=action_step_dim,
-                num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
-                head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
-                vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
-                att_mode=getattr(cfg, "att_mode", "causal"),
-                num_query_token=getattr(cfg, "num_query_token", 16),
                 use_raw_state_fusion=getattr(cfg, "use_raw_state_fusion", False),
                 raw_state_dim=getattr(cfg, "raw_state_dim", 8),
                 bias_init_enabled=getattr(cfg, "value_head_bias_init_enabled", False),
@@ -180,16 +142,15 @@ class BestOfNCriticTrainer:
             if num_q_heads < 1:
                 raise ValueError("Value head critic requires at least one head (num_q_heads >= 1).")
             heads = [
-                MYQueryValueHeadCritic(vh_config, text_config=text_config, use_no_query_head=use_no_query_head)
+                Qchunk_Former(vh_config, text_config=text_config)
                 for _ in range(num_q_heads)
             ]
             critic = ValueHeadCriticAdapter(heads).to(device)
-            print(critic)
-            # head = MYQueryValueHeadCritic(vh_config, text_config=text_config) # 两层transformer,同时编码query embedding以及 value embedding
-            # critic = ValueHeadCriticAdapter(head).to(device)
                     
         else:
-            raise ValueError(f"Unknown critic_type '{getattr(cfg, 'critic_type', 'mlp')}'.")
+            raise ValueError(
+                f"Unknown critic_type '{getattr(cfg, 'critic_type', 'mlp')}' (expected 'mlp' or 'q_chunk_former')."
+            )
 
         target_critic = copy.deepcopy(critic).to(device)
         critic.eval()
@@ -247,12 +208,51 @@ class BestOfNCriticTrainer:
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        self.critic.load_state_dict(state["critic"])
-        self.target_critic.load_state_dict(state["target_critic"])
-        self.optimizer.load_state_dict(state["optimizer"])
+        def _safe_load(module: nn.Module, payload: Dict[str, Any] | None, label: str) -> None:
+            if not isinstance(payload, dict):
+                if payload is not None:
+                    module.load_state_dict(payload)
+                return
+            current = module.state_dict()
+            filtered: Dict[str, torch.Tensor] = {}
+            dropped: list[str] = []
+            for key, value in payload.items():
+                if key not in current:
+                    dropped.append(key)
+                    continue
+                if current[key].shape != value.shape:
+                    dropped.append(key)
+                    continue
+                filtered[key] = value
+            if dropped:
+                sample = ", ".join(dropped[:5])
+                logging.warning(
+                    "Skipping %d %s keys due to mismatch (sample: %s)",
+                    len(dropped),
+                    label,
+                    sample,
+                )
+            module.load_state_dict(filtered, strict=False)
+
+        if "critic" in state or "target_critic" in state:
+            _safe_load(self.critic, state.get("critic"), "critic")
+            _safe_load(self.target_critic, state.get("target_critic"), "target_critic")
+        else:
+            _safe_load(self.critic, state, "critic")
+            _safe_load(self.target_critic, state, "target_critic")
+
+        optim_state = state.get("optimizer")
+        if optim_state is not None:
+            try:
+                self.optimizer.load_state_dict(optim_state)
+            except Exception as exc:  # pragma: no cover - eval may ignore optimizer
+                logging.warning("Skipping optimizer state load: %s", exc)
         sched_state = state.get("scheduler")
         if self.scheduler is not None and sched_state is not None:
-            self.scheduler.load_state_dict(sched_state)
+            try:
+                self.scheduler.load_state_dict(sched_state)
+            except Exception as exc:  # pragma: no cover - eval may ignore scheduler
+                logging.warning("Skipping scheduler state load: %s", exc)
 
     def update(
         self,
@@ -605,7 +605,6 @@ __all__ = [
     "PolicyEmbeddings",
     "PolicyEncoderFn",
     "MLPCriticAdapter",
-    "ValueQueryCriticAdapter",
     "ValueHeadCriticAdapter",
     "BestOfNCriticTrainer",
 ]

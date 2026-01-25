@@ -1,0 +1,8 @@
+// {
+//   "debug.disassemblyView.showSourceCode": false,
+//   "debug.variables.showDynamicView": false,
+//   "python.logging.level": "WARNING",
+//   "python.experiments.optInto": [
+//     "DebugpyLoadsCodeRunningDisableStandardOutput"
+//   ]
+// }

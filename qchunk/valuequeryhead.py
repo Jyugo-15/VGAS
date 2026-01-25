@@ -56,7 +56,7 @@ class ValueQueryHeadConfig:
     att_mode: str = "causal"
 
 
-class VQHBackbone(nn.Module):
+class Q_Former_Backbone(nn.Module):
     """Thin stack of decoder layers initialised from a SmolVLM text model."""
 
     def __init__(
@@ -164,14 +164,13 @@ class TransformerCriticHead(nn.Module):
         text_config: LlamaConfig | None = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         att_mode: str = "causal",  # causal / bi-level
-        num_query_token: int = 0,  # unused, kept for API compatibility
         bias_init_enabled: bool = False,
         bias_init_value: float = 0.0,
     ) -> None:
         super().__init__()
         self.bias_init_enabled = bias_init_enabled
         self.bias_init_value = bias_init_value
-        self.decoder = VQHBackbone(
+        self.decoder = Q_Former_Backbone(
             num_layers=num_layers,
             model_id=model_id,
             text_config=text_config,
@@ -262,7 +261,7 @@ class ValueQueryHead(nn.Module):
         super().__init__()
         self.config = config
         self.head_type = config.head_type if hasattr(config, "head_type") else "mlp"
-        backbone = VQHBackbone(
+        backbone = Q_Former_Backbone(
             num_layers=config.num_backbone_layers,
             model_id=config.vlm_model_name,
             text_config=text_config,
@@ -299,24 +298,6 @@ class ValueQueryHead(nn.Module):
 
         augmented_embs, aug_pad_masks, aug_att_masks = self._append_query_token_my(prefix_embs, pad_masks, att_masks) ##直接插入
         att_2d_masks = make_att_2d_masks(aug_pad_masks, aug_att_masks)
-        # Debug dump of mask tensors for inspection.
-        debug_dir = Path("")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-
-        def _dump_mask(name: str, tensor: torch.Tensor) -> None:
-            array = tensor.detach().cpu().numpy()
-            print(f"[ValueQueryHead] {name} shape={array.shape}:\n{array}")
-            np.save(debug_dir / f"{name}.npy", array)
-
-        # for mask_name, mask_tensor in (
-        #     ("pad_masks", pad_masks),
-        #     ("att_masks", att_masks),
-        #     ("aug_pad_masks", aug_pad_masks),
-        #     ("aug_att_masks", aug_att_masks),
-        #     ("att_2d_masks", att_2d_masks),
-        # ):
-        #     _dump_mask(mask_name, mask_tensor)
         
         attention_mask = _build_attention_mask(att_2d_masks, dtype=augmented_embs.dtype)
         position_ids = torch.cumsum(aug_pad_masks.long(), dim=1) - 1
@@ -481,21 +462,18 @@ class ValueHeadCritic(nn.Module):
             actions_is_pad=actions_is_pad,
         )
     
-class MYQueryValueHeadCritic(nn.Module):
+class Qchunk_Former(nn.Module):
     """Critic that consumes prefix tokens directly via a transformer head."""
 
     def __init__(
         self,
         config: ValueHeadConfig,
         text_config: LlamaConfig | None = None,
-        use_no_query_head: bool = False,
     ):
         super().__init__()
         if text_config is None and config.vlm_model_name is None:
             raise ValueError("TransformerValueCriticHead requires text_config or vlm_model_name.")
-        head_cls = TransformerValueCriticHead_noquery if use_no_query_head else TransformerValueCriticHead
-        if use_no_query_head:
-            print(f"***********Using TransformerValueCriticHead_noquery***********")
+        head_cls = Q_Former
         self.head = head_cls(
             hidden_dim=(text_config.hidden_size if text_config is not None else None),
             action_dim=config.action_dim,
@@ -504,7 +482,6 @@ class MYQueryValueHeadCritic(nn.Module):
             model_id=config.vlm_model_name,
             text_config=text_config,
             att_mode=config.att_mode,
-            num_query_token=config.num_query_token,
             bias_init_enabled=getattr(config, "bias_init_enabled", False),
             bias_init_value=getattr(config, "bias_init_value", 0.0),
         )
@@ -601,224 +578,12 @@ class MYQueryValueHeadCritic(nn.Module):
             **kwargs,
         )
 
-class TransformerValueCriticHead(nn.Module):
-    """Transformer-based head that produces a query - value embedding before scoring."""
 
-    def __init__(
-        self,
-        *,
-        hidden_dim: Optional[int],
-        action_dim: int,
-        num_layers: int = 2,
-        mlp_hidden_dims: Sequence[int] = (512, 512),
-        model_id: str | None = None,
-        text_config: LlamaConfig | None = None,
-        torch_dtype: torch.dtype = torch.bfloat16,
-        att_mode: str = "causal", #causal / bi_level，
-        num_query_token: int = 16,
-        bias_init_enabled: bool = False,
-        bias_init_value: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.bias_init_enabled = bias_init_enabled
-        self.bias_init_value = bias_init_value
-        self.decoder = VQHBackbone(
-            num_layers=num_layers,
-            model_id=model_id,
-            text_config=text_config,
-            torch_dtype=torch_dtype,
-        )
-        self.num_query_token = num_query_token
-        decoder_hidden = self.decoder.text_config.hidden_size
-        if hidden_dim is not None and decoder_hidden != hidden_dim:
-            raise ValueError("hidden_dim must match text hidden size")
-        self.hidden_dim = decoder_hidden
-        self.action_tokens = ActionTokenizer(action_dim, self.hidden_dim)
-        self.query_token = nn.Parameter(torch.empty(1, self.num_query_token, self.hidden_dim))
-        self.query_pos = nn.Parameter(torch.randn(1, self.num_query_token, self.hidden_dim))
-        nn.init.orthogonal_(self.query_pos)
-        nn.init.orthogonal_(self.query_token)
-        self.value_token = nn.Parameter(torch.zeros(self.hidden_dim))
-        layers: list[nn.Module] = []
-        prev_dim = self.hidden_dim
-        total_layers = len(mlp_hidden_dims)
-        for idx, hidden in enumerate(mlp_hidden_dims):
-            layers.append(nn.Linear(prev_dim, hidden))
-            if idx  < total_layers:
-                layers.append(nn.LayerNorm(hidden))
-                layers.append(nn.GELU())
-                layers.append(nn.Dropout(0.1))
-                # layers.append(nn.GELU())
-                # layers.append(nn.LayerNorm(hidden))
-            prev_dim = hidden
-        final_layer = nn.Linear(prev_dim, 1)
-        if bias_init_enabled and final_layer.bias is not None:
-            nn.init.constant_(final_layer.bias, bias_init_value)
-            print(f">>> Initializing value head bias to {bias_init_value}")
-        layers.append(final_layer)
-        self.value_head = nn.Sequential(*layers)
-        self.att_mode = att_mode
-    def prepare_mask_emb(
-        self,
-        prefix_embs,
-        actions,
-        pad_masks,
-        att_masks,
-        actions_is_pad,
-        query_emb=None,
-        action_embeds: torch.Tensor | None = None,
-    ):
-        """Construct tokens + masks.
-
-        - Query tokens (num_query_token): attend prefix + other queries, block actions.
-        - Action tokens: attend queries; if att_mode=="causal", also attend previous valid actions (causal mask).
-        - Value token: attend queries + valid actions; block prefix.
-        """
-        action_tokens = action_embeds if action_embeds is not None else self.action_tokens(actions)
-        batch_size = action_tokens.shape[0]
-        device = action_tokens.device
-        dtype = self.value_token.dtype
-
-        # Align prefix hidden size if needed
-        if actions_is_pad is None:
-            actions_is_pad = torch.zeros(batch_size, action_tokens.shape[1], dtype=torch.bool, device=device)
-
-        # Assemble token sequence: [prefix][queries][actions][value]
-        token_segments = [prefix_embs]
-        if query_emb is None:
-            base_query = self.query_token.to(device=device, dtype=dtype).reshape(1, self.num_query_token, self.hidden_dim)
-            query_tokens = base_query.expand(batch_size, self.num_query_token, -1)
-        else:
-            # If a single query embedding is provided, share it across all query slots.
-            query_tokens = query_emb.to(device=device, dtype=dtype).unsqueeze(1).expand(-1, self.num_query_token, -1)
-        query_pos = self.query_pos.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
-        query_tokens = query_tokens + query_pos
-        token_segments.append(query_tokens)
-        token_segments.append(action_tokens)
-        value_tokens = self.value_token.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 1, -1)
-        token_segments.append(value_tokens)
-        tokens = torch.cat(token_segments, dim=1).to(dtype)
-
-        # Pad mask (True=valid)
-        pad_segments = [
-            pad_masks,
-            torch.ones(batch_size, self.num_query_token, dtype=torch.bool, device=device),
-            ~actions_is_pad.bool(),
-            torch.ones(batch_size, 1, dtype=torch.bool, device=device),
-        ]
-        pad_mask = torch.cat(pad_segments, dim=1)
-
-        # att_mask (1D flags) can stay permissive; fine-grained control via att_2d_masks below.
-        att_segments = [
-            att_masks,
-            torch.ones(batch_size, self.num_query_token, dtype=torch.bool, device=device),
-            torch.ones(batch_size, action_tokens.shape[1], dtype=torch.bool, device=device),
-            torch.ones(batch_size, 1, dtype=torch.bool, device=device),
-        ]
-        att_mask = torch.cat(att_segments, dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_mask, att_mask)
-
-        prefix_len = prefix_embs.shape[1]
-        query_start = prefix_len
-        query_end = query_start + self.num_query_token
-        action_len = action_tokens.shape[1]
-        actions_start = query_end
-        actions_end = actions_start + action_len
-        value_pos = actions_end
-
-        valid_actions = (~actions_is_pad.bool()).to(att_2d_masks.device)
-        att_mode = str(self.att_mode).lower()
-
-        # Query tokens: can attend prefix + all queries, block actions.
-        att_2d_masks[:, query_start:query_end, :prefix_len] = pad_masks.unsqueeze(1)
-        att_2d_masks[:, query_start:query_end, query_start:query_end] = True
-        att_2d_masks[:, query_start:query_end, actions_start:actions_end] = False
-        att_2d_masks[:, query_start:query_end, value_pos:] = False
-
-        # Action tokens: only attend queries (not prefix/actions/value). Respect valid rows.
-        row_mask = valid_actions.unsqueeze(-1)  # (B, A, 1)
-        att_2d_masks[:, actions_start:actions_end, :] = False
-        att_2d_masks[:, actions_start:actions_end, query_start:query_end] = row_mask.expand(-1, -1, self.num_query_token)
-        att_2d_masks[:, actions_start:actions_end, :prefix_len] = False
-        att_2d_masks[:, actions_start:actions_end, value_pos:] = False
-        if att_mode == "causal":
-            # causal over previous valid actions
-            tril = torch.tril(torch.ones(action_len, action_len, dtype=torch.bool, device=att_2d_masks.device)).unsqueeze(0)
-            action_att = valid_actions.unsqueeze(1) & valid_actions.unsqueeze(2) & tril
-            att_2d_masks[:, actions_start:actions_end, actions_start:actions_end] = action_att
-        else:
-            # block action-action attention
-            action_full_att = valid_actions.unsqueeze(1) & valid_actions.unsqueeze(2)
-            att_2d_masks[:, actions_start:actions_end, actions_start:actions_end] = action_full_att
-
-        # Value token: attend queries + valid actions; block prefix.
-        att_2d_masks[:, value_pos:value_pos + 1, :prefix_len] = False
-        att_2d_masks[:, value_pos:value_pos + 1, query_start:query_end] = True
-        att_2d_masks[:, value_pos:value_pos + 1, actions_start:actions_end] = valid_actions.unsqueeze(1)
-
-        attention_mask = _build_attention_mask(att_2d_masks, dtype=tokens.dtype)
-        position_ids = torch.cumsum(pad_mask.long(), dim=1) - 1
-        position_ids = position_ids.clamp_min(0)
-
-        return tokens , attention_mask ,  position_ids
-    
-    def forward(
-        self,
-        *,
-        prefix_embs: Optional[torch.Tensor], # output of vlm
-        pad_masks: Optional[torch.Tensor],   # original input of vlm
-        att_masks: Optional[torch.Tensor],   # original input of vlm
-        query_emb: Optional[torch.Tensor],
-        actions: torch.Tensor | None = None,               # output of vla or from a batch
-        actions_is_pad : Optional[torch.Tensor] = None,    # True indicates padding on actions
-        inputs_embeds: torch.Tensor | None = None,         # precomputed action embeddings (B, T, hidden_dim)
-    ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            action_tokens = inputs_embeds
-            if actions_is_pad is None:
-                actions_is_pad = torch.zeros(
-                    action_tokens.shape[0],
-                    action_tokens.shape[1],
-                    dtype=torch.bool,
-                    device=action_tokens.device,
-                )
-            device = action_tokens.device
-        else:
-            if actions is None:
-                raise ValueError("Either `actions` or `inputs_embeds` must be provided.")
-            if actions_is_pad is None:
-                actions_is_pad = torch.zeros(
-                    actions.shape[0],
-                    actions.shape[1],
-                    dtype=torch.bool,
-                    device=actions.device,
-                )
-            device = actions.device
-            action_tokens = None
-
-        actions_arg = actions if action_tokens is None else None
-        tokens , attention_mask ,  position_ids = self.prepare_mask_emb(
-            prefix_embs,
-            actions_arg,  # type: ignore[arg-type]
-            pad_masks,
-            att_masks,
-            actions_is_pad,
-            query_emb,
-            action_embeds=action_tokens,
-        )
-        batch_size = (action_tokens if action_tokens is not None else actions).shape[0]
-        outputs = self.decoder(tokens, attention_mask=attention_mask, position_ids=position_ids)
-        prefix_len = prefix_embs.shape[1]
-        action_len = action_tokens.shape[1] if action_tokens is not None else actions.shape[1]
-        value_indices = prefix_len + self.num_query_token + action_len
-        batch_indices = torch.arange(batch_size, device=device)
-        value_emb = outputs[:, -1, :]
-        return self.value_head(value_emb)
-    
+# Backward-compatible alias for older imports.
+MYQueryValueHeadCritic = Qchunk_Former
 
 
-class TransformerValueCriticHead_noquery(nn.Module):
+class Q_Former(nn.Module):
     """Transformer-based head that produces a  value embedding before scoring."""
 
     def __init__(
@@ -832,14 +597,13 @@ class TransformerValueCriticHead_noquery(nn.Module):
         text_config: LlamaConfig | None = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         att_mode: str = "causal",  # causal / bi-level
-        num_query_token: int = 0,  # unused, kept for API compatibility
         bias_init_enabled: bool = False,
         bias_init_value: float = 0.0,
     ) -> None:
         super().__init__()
         self.bias_init_enabled = bias_init_enabled
         self.bias_init_value = bias_init_value
-        self.decoder = VQHBackbone(
+        self.decoder = Q_Former_Backbone(
             num_layers=num_layers,
             model_id=model_id,
             text_config=text_config,
@@ -881,7 +645,6 @@ class TransformerValueCriticHead_noquery(nn.Module):
         pad_masks,
         att_masks,
         actions_is_pad,
-        query_emb=None,
         action_embeds: torch.Tensor | None = None,
     ):
         # print(self.att_mode)
@@ -948,7 +711,6 @@ class TransformerValueCriticHead_noquery(nn.Module):
                     dtype=torch.bool,
                     device=action_tokens.device,
                 )
-            device = action_tokens.device
         else:
             if actions is None:
                 raise ValueError("Either `actions` or `inputs_embeds` must be provided.")
@@ -959,7 +721,6 @@ class TransformerValueCriticHead_noquery(nn.Module):
                     dtype=torch.bool,
                     device=actions.device,
                 )
-            device = actions.device
             action_tokens = None
         actions_arg = actions if action_tokens is None else None
         tokens , attention_mask ,  position_ids = self.prepare_mask_emb(
@@ -968,77 +729,9 @@ class TransformerValueCriticHead_noquery(nn.Module):
             pad_masks,
             att_masks,
             actions_is_pad,
-            query_emb,
             action_embeds=action_tokens,
         )
-        batch_size = (action_tokens if action_tokens is not None else actions).shape[0]
+
         outputs = self.decoder(tokens, attention_mask=attention_mask, position_ids=position_ids)
-        prefix_len = prefix_embs.shape[1]
-        action_len = action_tokens.shape[1] if action_tokens is not None else actions.shape[1]
-        value_indices = prefix_len + action_len
-        batch_indices = torch.arange(batch_size, device=device)
         value_emb = outputs[:, -1, :]
         return self.value_head(value_emb)
-
-
-# def _build_dummy_inputs():
-#     batch = 2
-#     prefix_seq = 5
-#     action_seq = 4
-#     hidden_dim = 8
-#     action_dim = 2
-#     prefix_embs = torch.randn(batch, prefix_seq, hidden_dim)
-#     pad_masks = torch.tensor(
-#         [
-#             [True, True, True, False, True], # image , lang, lang, lang_pad, state
-#             [True, True, False, False, True],
-#         ],
-#         dtype=torch.bool,
-#     )
-#     att_masks = torch.tensor(
-#         [
-#             [False, False, False, False, True], # image , lang, lang, lang_pad, state
-#             [False, False, False, False, True],
-#         ],
-#         dtype=torch.bool,
-#     )
-#     actions = torch.randn(batch, action_seq, action_dim)
-#     pad_list = [
-#         [False, False, True, True],
-#         [False, False, False, True],
-#     ]
-#     actions_is_pad = torch.tensor(pad_list, dtype=torch.bool)
-#     return prefix_embs, pad_masks, att_masks, actions, actions_is_pad, hidden_dim, action_dim
-
-
-# def _build_dummy_text_config(hidden_dim: int) -> LlamaConfig:
-#     return LlamaConfig(
-#         hidden_size=hidden_dim,
-#         intermediate_size=hidden_dim * 4,
-#         num_hidden_layers=2,
-#         num_attention_heads=2,
-#         rms_norm_eps=1e-5,
-#         vocab_size=32000,
-#         rope_scaling={"type": "linear", "factor": 1.0},
-#         attn_implementation="eager",
-#     )
-
-
-# if __name__ == "__main__":
-#     prefix_embs, pad_masks, att_masks, actions, mask, hidden_dim, action_dim = _build_dummy_inputs()
-#     config = ValueQueryHeadConfig(chunk_size=actions.shape[1], action_dim=action_dim)
-#     text_cfg = _build_dummy_text_config(hidden_dim)
-#     head = TransformerValueCriticHead(
-#         hidden_dim=hidden_dim,
-#         action_dim=config.action_dim,
-#         text_config=text_cfg,
-#     )
-#     with torch.no_grad():
-#         score = head(
-#             prefix_embs=prefix_embs,
-#             pad_masks=pad_masks,
-#             att_masks=att_masks,
-#             actions=actions,
-#             actions_is_pad=mask,
-#         )
-#     print("Dummy forward result:", score)

@@ -10,7 +10,7 @@ import torch
 from qchunk.qchunked_critic import PolicyEncoderFn, QChunkedCritic
 
 
-class CQFPolicy:
+class VGASPolicy:
     """
     Bundle a frozen actor with a critic to expose unified inference/training APIs.
 
@@ -41,7 +41,7 @@ class CQFPolicy:
         ds_meta: Any = None,
         device: str = "cuda",
         encoder_fn: Optional[PolicyEncoderFn] = None,
-    ) -> "CQFPolicy":
+    ) -> "VGASPolicy":
         """
         Construct a CQFPolicy by loading a frozen actor and building a critic.
 

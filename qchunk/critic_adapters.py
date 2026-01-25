@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from qchunk.networks import CriticBackbone
-from qchunk.valuequeryhead import ValueHeadCritic, ValueQueryHead
 
 class PolicyEmbeddings:
     """Lightweight container mirroring the structure used in the train script."""
@@ -55,41 +54,12 @@ class MLPCriticAdapter(nn.Module):
         return self.backbone(encoding.pooled, actions)
 
 
-class ValueQueryCriticAdapter(nn.Module):
-    """Wrap one or more ValueQueryHead modules and expose a twin-Q interface."""
-
-    def __init__(self, heads: Sequence[ValueQueryHead] | ValueQueryHead):
-        super().__init__()
-        if isinstance(heads, ValueQueryHead):
-            heads = [heads]
-        if len(heads) == 0:
-            raise ValueError("ValueQueryCriticAdapter requires at least one ValueQueryHead.")
-        self.heads = nn.ModuleList(heads)
-
-    def forward(
-        self,
-        encoding: PolicyEmbeddings,
-        actions: torch.Tensor,
-        action_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        return tuple(
-            head.forward_from_embeddings(
-                encoding.prefix_outs,
-                encoding.pad_masks,
-                encoding.att_masks,
-                actions,
-                action_mask,
-            )
-            for head in self.heads
-        )
-
-
 class ValueHeadCriticAdapter(nn.Module):
-    """Wrap one or more ValueHeadCritic modules and expose a twin-Q interface."""
+    """Wrap one or more value-head critics (e.g. Qchunk_Former) and expose twin-Q."""
 
-    def __init__(self, heads: Sequence[ValueHeadCritic] | ValueHeadCritic):
+    def __init__(self, heads: Sequence[nn.Module] | nn.Module):
         super().__init__()
-        if isinstance(heads, ValueHeadCritic):
+        if isinstance(heads, nn.Module):
             heads = [heads]
         if len(heads) == 0:
             raise ValueError("ValueHeadCriticAdapter requires at least one head.")

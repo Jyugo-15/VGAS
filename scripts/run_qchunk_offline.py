@@ -211,7 +211,13 @@ def parse_args() -> argparse.Namespace:
         help="Std for CalQL current-action noise (defaults to next noise std; set 0 to disable).",
     )
 
-    parser.add_argument("--critic-type", type=str, default="my_value_query_head", choices=["mlp", "value_query_head", "value_head","my_value_query_head","my_value_head"], help="Critic architecture to use for QC training.")
+    parser.add_argument(
+        "--critic-type",
+        type=str,
+        default="q_chunk_former",
+        choices=["mlp", "q_chunk_former", "my_value_query_head", "my_value_head", "value_head"],
+        help="Critic architecture to use for QC training (legacy names map to q_chunk_former).",
+    )
     parser.add_argument("--critic-head-type", type=str, default="transformer", choices=["mlp", "transformer"], help="Head to pair with value_query_head critics.")
     parser.add_argument("--critic-head-num-layers", type=int, default=2, help="Number of transformer layers for the critic head when applicable.")
     parser.add_argument("--critic-head-mlp-dims", type=int, nargs="+", default=None, help="MLP dimensions used inside the critic head (defaults to critic hidden dims).")
@@ -220,20 +226,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic-vqh-vlm-model-name", type=str, default=None, help="Override the VLM model name used when instantiating ValueQueryHead backbones.")
     parser.add_argument("--critic-num-q-heads", type=int, default=2, help="Number of independent Q heads when using ValueQueryHead critics.")
     parser.add_argument("--critic-loss-mode", type=str, default="per_head_mean", choices=["mse", "per_head_mean"], help="Reduction applied to critic TD errors.") # mse 对各个头求平均再做mse, per_head_mean 对 各个头先计算loss再做平均
-    parser.add_argument("--num-query-token", type=int, default=16, help="Number of query tokens for transformer critic heads.")
+    # parser.add_argument("--num-query-token", type=int, default=16, help="Number of query tokens for transformer critic heads.")
     parser.add_argument("--critic-warmup-steps", type=int, default=1000, help="Warmup steps for the critic learning rate.")
     parser.add_argument("--critic-total-steps", type=int, default=12000, help="Optional total steps for critic LR scheduling (defaults to --steps).")
     parser.add_argument("--critic-lr-final", type=float, default=2.5e-06, help="Final critic learning rate after decay (default 0, i.e. decay to zero).")
     parser.add_argument("--critic-value-head-num-layers", type=int, default=2, help="Number of transformer layers for value_head critics.")
     parser.add_argument("--critic-value-head-mlp-dims", type=int, nargs="+", default=None, help="MLP hidden dims for value_head critics (defaults to critic hidden dims).")
     parser.add_argument("--critic-value-head-vlm-model-name", type=str, default=None, help="Override VLM model when constructing value_head critics.")
-    parser.add_argument(
-        "--use-query-head",
-        type=str2bool,
-        dest="critic_query_head",
-        default=False,
-        help="Whether to use the query-based critic head (set False to use the no-query variant).",
-    )
+    # parser.add_argument(
+    #     "--use-query-head",
+    #     type=str2bool,
+    #     dest="critic_query_head",
+    #     default=False,
+    #     help="Whether to use the query-based critic head (set False to use the no-query variant).",
+    # )
     parser.add_argument(
         "--use-raw-state-fusion",
         type=str2bool,
@@ -251,13 +257,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_job_name(args: argparse.Namespace) -> str:
-    # Allow alias: my_value_head uses my_value_query_head without query token
-    if args.critic_type == "my_value_head":
-        args.critic_type = "my_value_query_head"
-        args.critic_query_head = False
+    # Normalize legacy aliases.
+    if args.critic_type in {"my_value_query_head", "my_value_head", "value_head"}:
+        args.critic_type = "q_chunk_former"
     if args.job_name:
         return args.job_name
-    layer_count = args.critic_value_head_num_layers if args.critic_type == "my_value_query_head" else args.critic_head_num_layers
+    layer_count = args.critic_value_head_num_layers if args.critic_type == "q_chunk_former" else args.critic_head_num_layers
     base = f"q_agg_{args.critic_q_agg}_layer_{layer_count}_crit_lm_{args.critic_loss_mode}"
     aug_tag = "aug" if getattr(args, "use_data_augmentations", True) else "noaug"
     calql_tag = "calql" if getattr(args, "use_calql", False) else "nocalql"
@@ -287,9 +292,8 @@ def build_env_config(args: argparse.Namespace):
 
 
 def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None) -> CriticConfig:
-    if args.critic_type == "my_value_head":
-        args.critic_type = "my_value_query_head"
-        args.critic_query_head = False
+    if args.critic_type in {"my_value_query_head", "my_value_head", "value_head"}:
+        args.critic_type = "q_chunk_former"
     head_mlp_dims = tuple(args.critic_head_mlp_dims) if args.critic_head_mlp_dims else tuple(args.critic_hidden_dims)
     vqh_hidden_dims = (
         tuple(args.critic_vqh_hidden_dims)

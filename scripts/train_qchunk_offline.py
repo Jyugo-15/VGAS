@@ -14,10 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import logging
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict, is_dataclass
+from itertools import islice
 from pathlib import Path
 from pprint import pformat
 from typing import Any, Dict, Optional
@@ -29,6 +31,7 @@ from torchvision.utils import save_image
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
+from torch.utils.data import DataLoader
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -71,7 +74,9 @@ from lerobot.utils.utils import (
 )
 from models.smolvla.modeling import make_att_2d_masks, resize_with_pad
 from qchunk.critic_adapters import PolicyEmbeddings
+from qchunk.critic_utils import aggregate_q, get_raw_state, get_tensor_from_batch, repeat_batch
 from qchunk.qchunked_critic import QChunkedCritic
+from qchunk.vgas_policy import VGASPolicy
 from data.lerobot_reward_dataset import RewardAugmentedLeRobotDataset
 from data.data_augmentations import vgps_augment, vgps_augment_vmap
 
@@ -102,12 +107,24 @@ class CriticConfig:
     temperature: float = 1.0
     use_ood_reg: bool = False
     ood_alpha: float = 1.0
+    ood_action_source: str = "erg"
     dist_penalty_beta: float = 0.5
+    dist_clamp_max: float | None = None
     ood_include_current_actions: bool = True
     ood_include_random_actions: bool = False
     ood_include_next_actions: bool = False
+    ood_noise_stds: tuple[float, ...] = (0.02,)
+    use_ood_noise: bool = True
+    use_ood_trunc: bool = True
+    use_ood_mix: bool = False
+    ood_mix_ratio: float = 0.5
+    ood_mix_alpha_low: float = 0.3
+    ood_mix_alpha_high: float = 0.7
+    debug_mix_dist: bool = False
+    use_pairwise_ood_loss: bool = False
+    pairwise_ood_loss_weight: float = 1.0
     num_query_token: int = 16
-    critic_type: str = "mlp"  # {"mlp", "value_query_head", "value_head"}
+    critic_type: str = "mlp"  # {"mlp", "q_chunk_former"}
     vqh_num_backbone_layers: int = 2
     vqh_hidden_dims: tuple[int, ...] = (512, 512)
     vqh_vlm_model_name: Optional[str] = None
@@ -135,6 +152,12 @@ class CriticConfig:
     ood_warmup_steps: int = 0
     tau_warmup: float | None = None
     tau_warmup_steps: int = 0
+    eval_ranking_freq: int = 0
+    eval_ranking_batches: int = 8
+    eval_ranking_action_samples: int = 8
+    eval_ranking_batch_size: int | None = 32
+    eval_ranking_start_step: int = 0
+    eval_ranking_full_dataset_root: str | None = None
 
 
 @dataclass
@@ -144,6 +167,7 @@ class TrainWithCriticPipelineConfig(TrainPipelineConfig):
     log_code_to_wandb: bool = False
     code_artifact_dir: Path | None = None
     q_chunk_len: int | None = None
+    critic_only: bool = False
 
 
 def _build_reward_augmented_dataset(cfg: TrainWithCriticPipelineConfig):
@@ -202,6 +226,188 @@ def _ensure_action_alias(batch: Dict[str, Any]) -> None:
         batch["action"] = batch[ACTION]
 
 
+def _compute_spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    x_rank_idx = torch.argsort(torch.argsort(x))
+    y_rank_idx = torch.argsort(torch.argsort(y))
+    x_rank = x_rank_idx.float()
+    y_rank = y_rank_idx.float()
+    x_center = x_rank - x_rank.mean()
+    y_center = y_rank - y_rank.mean()
+    denom = (x_center.norm() * y_center.norm()).clamp(min=1e-8)
+    corr = (x_center * y_center).sum() / denom
+    return float(corr.item())
+
+
+def _evaluate_critic_ranking(
+    policy: PreTrainedPolicy,
+    critic: QChunkedCritic,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_batches: int,
+    action_samples: int,
+    action_weights: torch.Tensor,
+    chunk_len: int,
+    preprocessor: Any,
+) -> Dict[str, float]:
+    metrics: Dict[str, list[float]] = {
+        "spearman_corr": [],
+        "spearman_corr_candi": [],
+        "top1_acc": [],
+        "gt_rank": [],
+        "effective_beta": [],
+        "q_gap_gt_vs_avg": [],
+        "sim_rank_of_best_q": [],
+        "q_rank_of_best_sim": [],
+        "sim_rank_of_best_q_candi": [],
+        "q_rank_of_best_sim_candi": [],
+        "top1_hit_rate_candi": [],
+        "top3_hit_rate_candi": [],
+        "top4_hit_rate_candi": [],
+    }
+
+    was_training_policy = policy.training
+    was_training_critic = critic.critic.training
+    policy.eval()
+    critic.critic.eval()
+
+    cpu_rng = torch.random.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    try:
+        with torch.no_grad():
+            for batch in islice(dataloader, max_batches):
+                raw_batch = batch
+                _ = raw_batch.pop("next_observations", None)
+                raw_snapshot = {k: v for k, v in raw_batch.items()}
+                batch_proc = preprocessor(raw_batch)
+                _merge_transition_keys(batch_proc, raw_batch)
+                _ensure_action_alias(batch_proc)
+                _ensure_reward_metadata(batch_proc, raw_snapshot)
+                batch_on_device = {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch_proc.items()
+                }
+                if OBS_LANGUAGE_TOKENS not in batch_on_device:
+                    logging.warning("Ranking eval skip batch: missing %s after preprocess", OBS_LANGUAGE_TOKENS)
+                    continue
+                encoding = critic.encode_policy(policy, batch_on_device).to(device)
+                batch_size = batch_on_device["action"].shape[0]
+                raw_state = get_raw_state(
+                    batch_on_device,
+                    batch_size,
+                    getattr(critic.cfg, "raw_state_dim", critic._raw_state_dim),
+                    device,
+                )
+                gt_actions = batch_on_device["action"]
+                if gt_actions.shape[1] > chunk_len:
+                    gt_actions = gt_actions[:, :chunk_len]
+                gt_mask = get_tensor_from_batch(
+                    batch_on_device,
+                    ["actions_is_pad", "action_is_pad"],
+                    default_shape=gt_actions.shape[:2],
+                    device=device,
+                )
+                if gt_mask.shape[-1] > chunk_len:
+                    gt_mask = gt_mask[..., :chunk_len]
+                gt_mask = gt_mask.to(device).bool()
+
+                expanded_batch = repeat_batch(batch_on_device, batch_size, action_samples)
+                policy_candidates = policy.predict_action_chunk(expanded_batch)
+                if policy_candidates.shape[1] < chunk_len:
+                    raise ValueError(
+                        f"Policy chunk ({policy_candidates.shape[1]}) shorter than q_chunk_len ({chunk_len})."
+                    )
+                if policy_candidates.shape[1] > chunk_len:
+                    policy_candidates = policy_candidates[:, :chunk_len]
+                policy_candidates = policy_candidates.view(batch_size, action_samples, chunk_len, -1)
+                gt_expanded = gt_actions.unsqueeze(1)
+                candidates = torch.cat([gt_expanded, policy_candidates], dim=1)
+
+                diff = (candidates - gt_expanded) ** 2
+                policy_mask = gt_mask.unsqueeze(1).expand(batch_size, action_samples, chunk_len)
+                combined_mask = torch.cat([gt_mask.unsqueeze(1), policy_mask], dim=1)
+                valid_mask = (~combined_mask).unsqueeze(-1)
+                weighted = diff * action_weights
+                weighted = weighted * valid_mask
+                valid_count = valid_mask.sum(dim=(-1, -2)).clamp(min=1.0)
+                dists = weighted.sum(dim=(-1, -2)) / valid_count
+
+                batch_size, num_candidates, steps, act_dim = candidates.shape
+                flat_candidates = candidates.view(-1, steps, act_dim)
+                flat_mask = combined_mask.view(-1, steps)
+                rep_encoding = encoding.repeat(num_candidates)
+                rep_raw_state = raw_state.repeat_interleave(num_candidates, dim=0)
+
+                q_vals = critic.critic(
+                    rep_encoding,
+                    flat_candidates,
+                    action_mask=flat_mask,
+                    raw_state=rep_raw_state,
+                )
+                q_vals = aggregate_q(q_vals, getattr(critic.cfg, "q_aggregation", "mean")).view(
+                    batch_size, num_candidates
+                )
+
+                d_cpu = dists.cpu()
+                q_cpu = q_vals.cpu()
+                for b in range(batch_size):
+                    d = d_cpu[b]
+                    q = q_cpu[b]
+                    corr = _compute_spearman_corr(-d, q)
+                    metrics["spearman_corr"].append(corr)
+                    if q.shape[0] > 1:
+                        corr_candi = _compute_spearman_corr(-d[1:], q[1:])
+                        metrics["spearman_corr_candi"].append(corr_candi)
+                    best_dist_idx = int(torch.argmin(d).item())
+                    best_q_idx = int(torch.argmax(q).item())
+                    dist_order = torch.argsort(d, descending=False)
+                    q_order = torch.argsort(q, descending=True)
+                    sim_rank_best_q = int((dist_order == best_q_idx).nonzero(as_tuple=False).item()) + 1
+                    q_rank_best_sim = int((q_order == best_dist_idx).nonzero(as_tuple=False).item()) + 1
+                    metrics["sim_rank_of_best_q"].append(float(sim_rank_best_q))
+                    metrics["q_rank_of_best_sim"].append(float(q_rank_best_sim))
+                    metrics["top1_acc"].append(1.0 if best_dist_idx == best_q_idx else 0.0)
+                    if q.shape[0] > 1:
+                        d_candi = d[1:]
+                        q_candi = q[1:]
+                        best_candi_idx = int(torch.argmin(d_candi).item())
+                        q_order_candi = torch.argsort(q_candi, descending=True)
+                        dist_order_candi = torch.argsort(d_candi, descending=False)
+                        best_q_candi_idx = int(torch.argmax(q_candi).item())
+                        sim_rank_best_q_c = int((dist_order_candi == best_q_candi_idx).nonzero(as_tuple=False).item()) + 1
+                        q_rank_best_sim_c = int((q_order_candi == best_candi_idx).nonzero(as_tuple=False).item()) + 1
+                        metrics["sim_rank_of_best_q_candi"].append(float(sim_rank_best_q_c))
+                        metrics["q_rank_of_best_sim_candi"].append(float(q_rank_best_sim_c))
+                        metrics["top1_hit_rate_candi"].append(
+                            1.0 if best_candi_idx == int(q_order_candi[0].item()) else 0.0
+                        )
+                        top3_hit_c = 1.0 if best_candi_idx in q_order_candi[:3].tolist() else 0.0
+                        top4_hit_c = 1.0 if best_candi_idx in q_order_candi[:4].tolist() else 0.0
+                        metrics["top3_hit_rate_candi"].append(top3_hit_c)
+                        metrics["top4_hit_rate_candi"].append(top4_hit_c)
+                    gt_rank = int((q_order == 0).nonzero(as_tuple=False).item())
+                    metrics["gt_rank"].append(gt_rank)
+                    q_gt = float(q[0].item())
+                    q_others = float(q[1:].mean().item()) if q.shape[0] > 1 else q_gt
+                    dist_others = float(d[1:].mean().item()) if d.shape[0] > 1 else 0.0
+                    if dist_others > 1e-6:
+                        slope = (q_gt - q_others) / dist_others
+                        metrics["effective_beta"].append(slope)
+                    metrics["q_gap_gt_vs_avg"].append(q_gt - q_others)
+    finally:
+        torch.random.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        if was_training_policy:
+            policy.train()
+        if was_training_critic:
+            critic.critic.train()
+
+    summary = {
+        k: float(torch.tensor(v, dtype=torch.float32).mean().item()) if len(v) > 0 else 0.0
+        for k, v in metrics.items()
+    }
+    return summary
+
 def _ensure_reward_metadata(batch: Dict[str, Any], raw_snapshot: Dict[str, Any]) -> None:
     rewards = batch.get("rewards")
     if rewards is None and REWARD in batch and isinstance(batch[REWARD], torch.Tensor):
@@ -241,6 +447,28 @@ def _propagate_future_pad(processed_future: Optional[Dict[str, Any]], original_f
     for key in ("next_observation_is_pad", "next_obs_valid_chunk_len"):
         if key in original_future and key not in processed_future:
             processed_future[key] = original_future[key]
+
+
+def _build_ranking_eval_loader(
+    dataset: torch.utils.data.Dataset,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int = 2,
+) -> DataLoader:
+    gen = torch.Generator()
+    gen.manual_seed(torch.seed())
+    sampler = torch.utils.data.RandomSampler(dataset, generator=gen)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+    )
 
 
 def my_prepare_images(self, batch):
@@ -312,70 +540,70 @@ def my_prepare_images(self, batch):
     return images, img_masks
 
 
-def encode_policy_observations_test( # 封装数据增强以及是否使用vlm backbone提取特征
-    policy: PreTrainedPolicy,
-    batch: Dict[str, torch.Tensor],
-    use_data_augmentations: bool = False,
-    use_vlm_backbone_encode: bool = True,
-) -> PolicyEmbeddings:
-    """Encode observations via the SmolVLA backbone, detached from gradients."""
-    # 增加数据增强 目的是训练数据偏少的情况下容易过拟合
-    training = policy.training
-    policy.eval()
-    processed_batch = policy._prepare_batch({k: v for k, v in batch.items()})
-    old = policy.prepare_images
-    try:
-        if use_data_augmentations:
-            policy.prepare_images = MethodType(my_prepare_images, policy)
-        images, img_masks = policy.prepare_images(processed_batch)
-    finally:
-        policy.prepare_images = old
+# def encode_policy_observations_test( # 封装数据增强以及是否使用vlm backbone提取特征
+#     policy: PreTrainedPolicy,
+#     batch: Dict[str, torch.Tensor],
+#     use_data_augmentations: bool = False,
+#     use_vlm_backbone_encode: bool = True,
+# ) -> PolicyEmbeddings:
+#     """Encode observations via the SmolVLA backbone, detached from gradients."""
+#     # 增加数据增强 目的是训练数据偏少的情况下容易过拟合
+#     training = policy.training
+#     policy.eval()
+#     processed_batch = policy._prepare_batch({k: v for k, v in batch.items()})
+#     old = policy.prepare_images
+#     try:
+#         if use_data_augmentations:
+#             policy.prepare_images = MethodType(my_prepare_images, policy)
+#         images, img_masks = policy.prepare_images(processed_batch)
+#     finally:
+#         policy.prepare_images = old
 
-    state = policy.prepare_state(processed_batch)
-    lang_tokens = processed_batch[f"{OBS_LANGUAGE_TOKENS}"]
-    lang_masks = processed_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+#     state = policy.prepare_state(processed_batch)
+#     lang_tokens = processed_batch[f"{OBS_LANGUAGE_TOKENS}"]
+#     lang_masks = processed_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-    prefix_embs, pad_masks, att_masks = policy.model.embed_prefix(
-        images, img_masks, lang_tokens, lang_masks, state=state
-    )
-    att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-    position_ids = torch.cumsum(pad_masks, dim=1) - 1
-    # ******
-    if use_vlm_backbone_encode:
-        outputs_embeds, _ = policy.model.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-            fill_kv_cache=True,
-        )
+#     prefix_embs, pad_masks, att_masks = policy.model.embed_prefix(
+#         images, img_masks, lang_tokens, lang_masks, state=state
+#     )
+#     att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+#     position_ids = torch.cumsum(pad_masks, dim=1) - 1
+#     # ******
+#     if use_vlm_backbone_encode:
+#         outputs_embeds, _ = policy.model.vlm_with_expert.forward(
+#             attention_mask=att_2d_masks,
+#             position_ids=position_ids,
+#             past_key_values=None,
+#             inputs_embeds=[prefix_embs, None],
+#             use_cache=False,
+#             fill_kv_cache=True,
+#         )
 
-        prefix_outputs = outputs_embeds[0].to(torch.float32)
-    else:
-        prefix_outputs = prefix_embs
-    pad_mask_bool = pad_masks.bool()
-    att_mask_bool = att_masks.bool()
+#         prefix_outputs = outputs_embeds[0].to(torch.float32)
+#     else:
+#         prefix_outputs = prefix_embs
+#     pad_mask_bool = pad_masks.bool()
+#     att_mask_bool = att_masks.bool()
 
-    def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        mask = mask.unsqueeze(-1).to(tensor.dtype)
-        summed = (tensor * mask).sum(dim=1)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return summed / denom
+#     def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         mask = mask.unsqueeze(-1).to(tensor.dtype)
+#         summed = (tensor * mask).sum(dim=1)
+#         denom = mask.sum(dim=1).clamp_min(1.0)
+#         return summed / denom
 
-    content_mask = (~att_mask_bool) & pad_mask_bool
-    state_mask = att_mask_bool & pad_mask_bool
+#     content_mask = (~att_mask_bool) & pad_mask_bool
+#     state_mask = att_mask_bool & pad_mask_bool
 
-    img_lang_emb = masked_mean(prefix_outputs, content_mask)
-    state_emb = masked_mean(prefix_outputs, state_mask)
-    embedding = torch.cat([img_lang_emb, state_emb], dim=-1)
-    policy.train(training)
-    return PolicyEmbeddings(
-        pooled=embedding.detach(),
-        prefix_outs=prefix_outputs.detach(),
-        pad_masks=pad_masks.detach(),
-        att_masks=att_masks.detach(),
-    )
+#     img_lang_emb = masked_mean(prefix_outputs, content_mask)
+#     state_emb = masked_mean(prefix_outputs, state_mask)
+#     embedding = torch.cat([img_lang_emb, state_emb], dim=-1)
+#     policy.train(training)
+#     return PolicyEmbeddings(
+#         pooled=embedding.detach(),
+#         prefix_outs=prefix_outputs.detach(),
+#         pad_masks=pad_masks.detach(),
+#         att_masks=att_masks.detach(),
+#     )
 
 
 def encode_policy_observations(policy: PreTrainedPolicy, batch: Dict[str, torch.Tensor]) -> PolicyEmbeddings:
@@ -769,7 +997,11 @@ def train(cfg: TrainWithCriticPipelineConfig):
     )
 
     logging.info("Start offline training on a fixed dataset")
-    critic_trainer: Optional[QChunkedCritic] = None
+    critic: Optional[QChunkedCritic] = None
+    vgas_policy: Optional[VGASPolicy] = None
+    ranking_loader: Optional[DataLoader] = None
+    ranking_full_loader: Optional[DataLoader] = None
+    ranking_full_dataset = None
     ######### offline step
     for _ in range(step, cfg.steps):
         # if _ % 10 == 0:
@@ -792,15 +1024,15 @@ def train(cfg: TrainWithCriticPipelineConfig):
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         
-        if cfg.critic.enable and critic_trainer is None:
-            critic_trainer = QChunkedCritic.build(
+        if cfg.critic.enable and critic is None:
+            critic = QChunkedCritic.build(
                 policy_path=Path(cfg.policy.pretrained_path) if cfg.policy.pretrained_path else Path(cfg.output_dir),
                 policy_cfg=cfg.policy,
                 critic_cfg=cfg.critic,
                 sample_batch=batch,
                 ds_meta=dataset.meta,
                 device=device,
-                encoder_fn=lambda p, b: encode_policy_observations_test(
+                encoder_fn=lambda p, b: encode_policy_observations(
                     p,
                     b,
                     use_data_augmentations=getattr(cfg, "use_data_augmentations", False),
@@ -808,9 +1040,10 @@ def train(cfg: TrainWithCriticPipelineConfig):
                 ),
                 actor=policy,
             )
+            vgas_policy = VGASPolicy(actor=policy, critic=critic)
             if critic_state_resume_dir is not None:
                 print("reusing Critic")
-                load_critic_state(critic_trainer, critic_state_resume_dir)
+                load_critic_state(critic, critic_state_resume_dir)
                 critic_state_resume_dir = None
 
         output_dict: Dict[str, Any] = {}
@@ -826,10 +1059,10 @@ def train(cfg: TrainWithCriticPipelineConfig):
                 use_amp=cfg.policy.use_amp,
             )
         critic_metrics = None
-        if critic_trainer is not None:
+        if vgas_policy is not None:
             critic_start = time.perf_counter()
             warmup_steps = getattr(cfg.critic, "ood_warmup_steps", 0)
-            critic_metrics = critic_trainer.update(
+            critic_metrics = vgas_policy.update_critic(
                 batch,
                 current_step=step,
                 ood_warmup_steps=warmup_steps,
@@ -883,42 +1116,131 @@ def train(cfg: TrainWithCriticPipelineConfig):
                 )
                 if wandb_logger and cfg.log_policy_to_wandb:
                     wandb_logger.log_policy(checkpoint_dir)
-            save_critic_state(critic_trainer, checkpoint_dir)
+            save_critic_state(critic, checkpoint_dir)
             save_critic_step(step, checkpoint_dir)
             update_last_checkpoint(checkpoint_dir)
+
+        eval_freq = getattr(cfg.critic, "eval_ranking_freq", 0)
+        eval_start = max(0, int(getattr(cfg.critic, "eval_ranking_start_step", 0)))
+        if eval_freq > 0 and step > eval_start and step % eval_freq == 0 and critic is not None:
+            batch_size_eval = getattr(cfg.critic, "eval_ranking_batch_size", None) or cfg.batch_size
+            if ranking_loader is None:
+                ranking_loader = _build_ranking_eval_loader(
+                    dataset,
+                    batch_size_eval,
+                    num_workers=cfg.num_workers,
+                    pin_memory=device.type == "cuda",
+                    prefetch_factor=2,
+                )
+            action_samples_eval = getattr(cfg.critic, "eval_ranking_action_samples", 8)
+            max_batches_eval = getattr(cfg.critic, "eval_ranking_batches", 4)
+            weights = cfg.critic.action_distance_weights or (5.0, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0)
+            action_weights = torch.tensor(weights, device=device, dtype=torch.float32).view(1, 1, 1, -1)
+            ranking_metrics = _evaluate_critic_ranking(
+                policy,
+                critic,
+                ranking_loader,
+                device,
+                max_batches=max_batches_eval,
+                action_samples=action_samples_eval,
+                action_weights=action_weights,
+                chunk_len=critic.q_chunk_len,
+                preprocessor=preprocessor,
+            )
+            rank_time = time.perf_counter() - start_time
+            metrics_to_log = {f"rank_eval/train/{k}": v for k, v in ranking_metrics.items()}
+            metrics_to_log["rank_eval/train/time_s"] = rank_time
+
+            full_root = getattr(cfg.critic, "eval_ranking_full_dataset_root", None)
+            if full_root:
+                if ranking_full_loader is None:
+                    tmp_cfg = copy.deepcopy(cfg)
+                    tmp_cfg.dataset = copy.deepcopy(cfg.dataset)
+                    tmp_cfg.dataset.root = str(full_root)
+                    tmp_cfg.dataset.include_future_observation = False
+                    try:
+                        ranking_full_dataset = _build_reward_augmented_dataset(tmp_cfg)
+                    except Exception as exc:
+                        logging.warning("Full-data ranking dataset build failed (%s); skipping full eval.", exc)
+                        ranking_full_dataset = None
+                    if ranking_full_dataset is not None:
+                        ranking_full_loader = _build_ranking_eval_loader(
+                            ranking_full_dataset,
+                            batch_size_eval,
+                            num_workers=cfg.num_workers,
+                            pin_memory=device.type == "cuda",
+                            prefetch_factor=2,
+                        )
+                if ranking_full_loader is not None:
+                    start_full = time.perf_counter()
+                    full_metrics = _evaluate_critic_ranking(
+                        policy,
+                        critic,
+                        ranking_full_loader,
+                        device,
+                        max_batches=max_batches_eval,
+                        action_samples=action_samples_eval,
+                        action_weights=action_weights,
+                        chunk_len=critic.q_chunk_len,
+                        preprocessor=preprocessor,
+                    )
+                    rank_full_time = time.perf_counter() - start_full
+                    metrics_to_log.update({f"rank_eval/full/{k}": v for k, v in full_metrics.items()})
+                    metrics_to_log["rank_eval/full/time_s"] = rank_full_time
+
+            if wandb_logger:
+                wandb_logger.log_dict(metrics_to_log, step)
+            logging.info(
+                "RankEval step %s | train spearman=%.4f top1=%.4f gt_rank=%.2f eff_beta=%.4f q_gap=%.4f time=%.2fs%s",
+                step,
+                ranking_metrics["spearman_corr"],
+                ranking_metrics["top1_acc"],
+                ranking_metrics["gt_rank"],
+                ranking_metrics["effective_beta"],
+                ranking_metrics["q_gap_gt_vs_avg"],
+                rank_time,
+                (
+                    f" | full spearman={metrics_to_log.get('rank_eval/full/spearman_corr', 0.0):.4f}"
+                    f" top1={metrics_to_log.get('rank_eval/full/top1_acc', 0.0):.4f}"
+                    f" gt_rank={metrics_to_log.get('rank_eval/full/gt_rank', 0.0):.2f}"
+                    f" eff_beta={metrics_to_log.get('rank_eval/full/effective_beta', 0.0):.4f}"
+                    f" q_gap={metrics_to_log.get('rank_eval/full/q_gap_gt_vs_avg', 0.0):.4f}"
+                    f" time={metrics_to_log.get('rank_eval/full/time_s', 0.0):.2f}s"
+                )
+            )
 
     
 def _critic_state_path(checkpoint_dir: Path) -> Path:
     return checkpoint_dir / TRAINING_STATE_DIR / CRITIC_STATE_FILE
 
 
-def save_critic_state(critic_trainer: Optional[QChunkedCritic], checkpoint_dir: Path) -> None:
-    if critic_trainer is None:
+def save_critic_state(critic: Optional[QChunkedCritic], checkpoint_dir: Path) -> None:
+    if critic is None:
         return
     critic_path = checkpoint_dir / "critic_pretrained_model"
     critic_path.mkdir(parents=True, exist_ok=True)
     last_state = critic_path / "last.ckpt"
     payload = {
-        "state_dict": critic_trainer.state_dict(),
+        "state_dict": critic.state_dict(),
         "meta": {
-            "chunk_size": getattr(critic_trainer, "chunk_size", None),
-            "action_step_dim": getattr(critic_trainer, "action_step_dim", None),
+            "chunk_size": getattr(critic, "chunk_size", None),
+            "action_step_dim": getattr(critic, "action_step_dim", None),
         },
     }
-    cfg = getattr(critic_trainer, "cfg", None)
+    cfg = getattr(critic, "cfg", None)
     if cfg is not None and is_dataclass(cfg):
         payload["critic_config"] = asdict(cfg)
     torch.save(payload, last_state)
 
 
-def load_critic_state(critic_trainer: Optional[QChunkedCritic], checkpoint_dir: Path) -> None:
-    if critic_trainer is None:
+def load_critic_state(critic: Optional[QChunkedCritic], checkpoint_dir: Path) -> None:
+    if critic is None:
         return
     critic_path = checkpoint_dir / "critic_pretrained_model" / "last.ckpt"
     if critic_path.exists():
-        payload = torch.load(critic_path, map_location=critic_trainer.device)
+        payload = torch.load(critic_path, map_location=critic.device)
         state = payload.get("state_dict", payload)
-        critic_trainer.load_state_dict(state)
+        critic.load_state_dict(state)
 
 
 def _critic_step_path(checkpoint_dir: Path) -> Path:

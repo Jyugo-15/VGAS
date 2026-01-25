@@ -26,7 +26,7 @@ from lerobot.utils.constants import ACTION
 from lerobot.utils.random_utils import set_seed
 
 from qchunk.best_of_n_critic import BestOfNCriticTrainer
-from scripts.train_qchunk_offline import CriticConfig, encode_policy_observations_test
+from scripts.train_qchunk_offline import CriticConfig, encode_policy_observations
 
 
 @dataclass
@@ -77,7 +77,7 @@ def evaluate_policy_with_best_of_n(
     encoder_fn = (
         policy_bundle.encoder_fn
         if policy_bundle is not None
-        else lambda p, b: encode_policy_observations_test(
+        else lambda p, b: encode_policy_observations(
             p,
             b,
             use_data_augmentations=use_data_augmentations,
@@ -379,7 +379,7 @@ def build_policy_eval_bundle(
 
     envs = make_env(sample_env_cfg, n_envs=sample_batch_size, use_async_envs=False)
 
-    encoder_fn = lambda p, b: encode_policy_observations_test(
+    encoder_fn = lambda p, b: encode_policy_observations(
         p,
         b,
         use_data_augmentations=use_data_augmentations,

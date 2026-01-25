@@ -16,7 +16,6 @@ from qchunk.critic_adapters import (
     MLPCriticAdapter,
     PolicyEmbeddings,
     ValueHeadCriticAdapter,
-    ValueQueryCriticAdapter,
 )
 from qchunk.critic_utils import (
     aggregate_q,
@@ -31,14 +30,10 @@ from qchunk.networks import CriticBackbone
 from qchunk.ood_calql_utils import (
     compute_calql_loss,
     compute_explicit_penalty_loss,
-    compute_weighted_distance,
-    prepare_ood_actions,
+    prepare_cal_ood_actions,
+    prepare_erg_ood_actions,
 )
-from qchunk.valuequeryhead import (
-    MYQueryValueHeadCritic,
-    ValueHeadConfig,
-    ValueHeadCritic,
-)
+from qchunk.valuequeryhead import Qchunk_Former, ValueHeadConfig
 
 
 class PolicyEncoderFn:
@@ -59,6 +54,7 @@ class QChunkedCritic:
         cfg: Any,
         device: torch.device,
         chunk_size: int,
+        q_chunk_len: int,
         action_step_dim: int,
         encoder_fn: PolicyEncoderFn,
         scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
@@ -72,6 +68,13 @@ class QChunkedCritic:
         self.cfg = cfg
         self.device = device
         self.chunk_size = chunk_size
+        self.q_chunk_len = int(q_chunk_len)
+        if self.q_chunk_len <= 0:
+            raise ValueError(f"q_chunk_len must be > 0, got {self.q_chunk_len}.")
+        if self.q_chunk_len > self.chunk_size:
+            raise ValueError(
+                f"q_chunk_len ({self.q_chunk_len}) cannot exceed chunk_size ({self.chunk_size})."
+            )
         self.action_step_dim = action_step_dim
         self.encode_policy = encoder_fn
         self.action_stats = action_stats or {}
@@ -87,31 +90,31 @@ class QChunkedCritic:
         cls,
         policy: Any,
         cfg: Any,
-        chunk_size: int,
+        q_chunk_len: int,
         action_step_dim: int,
         obs_dim: int,
         device: torch.device,
     ):
         critic_type = str(getattr(cfg, "critic_type", "mlp")).lower()
+        if critic_type in {"my_value_query_head", "my_value_head", "value_head"}:
+            critic_type = "q_chunk_former"
         if critic_type == "mlp":
             backbone = CriticBackbone(
                 obs_dim=obs_dim,
-                action_dim=action_step_dim * chunk_size,
+                action_dim=action_step_dim * q_chunk_len,
                 hidden_sizes=getattr(cfg, "hidden_dims", (512, 512)),
             )
             critic = MLPCriticAdapter(backbone).to(device)
-        elif critic_type in {"value_head", "my_value_query_head", "my_value_head"}:
+        elif critic_type == "q_chunk_former":
             text_config = getattr(getattr(getattr(policy, "model", None), "vlm_with_expert", None), "config", None)
             text_config = getattr(text_config, "text_config", None)
-            use_no_query = not bool(getattr(cfg, "critic_query_head", True))
             vh_config = ValueHeadConfig(
-                chunk_size=chunk_size,
+                chunk_size=q_chunk_len,
                 action_dim=action_step_dim,
                 num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),
-                num_query_token=getattr(cfg, "num_query_token", 16),
                 use_raw_state_fusion=getattr(cfg, "use_raw_state_fusion", False),
                 raw_state_dim=getattr(cfg, "raw_state_dim", 8),
                 bias_init_enabled=getattr(cfg, "value_head_bias_init_enabled", False),
@@ -119,12 +122,12 @@ class QChunkedCritic:
             )
             num_q_heads = max(1, int(getattr(cfg, "num_q_heads", 1)))
             heads = [
-                MYQueryValueHeadCritic(vh_config, text_config=text_config, use_no_query_head=use_no_query)
+                Qchunk_Former(vh_config, text_config=text_config)
                 for _ in range(num_q_heads)
             ]
             critic = ValueHeadCriticAdapter(heads).to(device)
         else:
-            raise ValueError(f"Unknown critic_type {critic_type}")
+            raise ValueError(f"Unknown critic_type {critic_type} (expected 'mlp' or 'q_chunk_former').")
         return critic
 
     @classmethod
@@ -141,10 +144,8 @@ class QChunkedCritic:
         actor: Any = None,
     ) -> "QChunkedCritic":
         from lerobot.policies.factory import make_policy
-        try:
-            from scripts.train_qchunk_offline import encode_policy_observations
-        except ImportError:  # pragma: no cover - fallback for legacy layout
-            from smolvla_qchunk.lerobot_ext.train_with_critic_new_offline import encode_policy_observations
+        from scripts.train_qchunk_offline import encode_policy_observations
+
 
         policy_cfg.device = device
         policy_cfg.pretrained_path = str(policy_path)
@@ -157,10 +158,18 @@ class QChunkedCritic:
         actions = sample_batch["action"]
         chunk_size = actions.shape[-2]
         action_step_dim = actions.shape[-1]
+        q_chunk_len = getattr(critic_cfg, "q_chunk_len", None)
+        if q_chunk_len is None:
+            raise ValueError("critic_cfg.q_chunk_len must be set to use the critic.")
+        q_chunk_len = int(q_chunk_len)
+        if q_chunk_len <= 0:
+            raise ValueError(f"critic_cfg.q_chunk_len must be > 0, got {q_chunk_len}.")
+        if q_chunk_len > chunk_size:
+            raise ValueError(f"critic_cfg.q_chunk_len ({q_chunk_len}) cannot exceed chunk_size ({chunk_size}).")
         encoder = encoder_fn or encode_policy_observations
         encoding: PolicyEmbeddings = encoder(actor, sample_batch)
         obs_dim = encoding.pooled.shape[-1]
-        critic = cls._build_critic_module(actor, critic_cfg, chunk_size, action_step_dim, obs_dim, torch.device(device))
+        critic = cls._build_critic_module(actor, critic_cfg, q_chunk_len, action_step_dim, obs_dim, torch.device(device))
         target_critic = copy.deepcopy(critic).to(device)
         optimizer = torch.optim.Adam(
             critic.parameters(),
@@ -199,6 +208,7 @@ class QChunkedCritic:
             cfg=critic_cfg,
             device=torch.device(device),
             chunk_size=chunk_size,
+            q_chunk_len=q_chunk_len,
             action_step_dim=action_step_dim,
             encoder_fn=encoder,
             scheduler=scheduler,
@@ -222,12 +232,22 @@ class QChunkedCritic:
         batch_size = first_tensor.shape[0]
         encoding = self.encode_policy(self.actor, batch).to(self.device)
         raw_state = get_raw_state(batch, batch_size, getattr(self.cfg, "raw_state_dim", self._raw_state_dim), self.device)
+        q_chunk_len = self.q_chunk_len
         action_samples = action_samples or getattr(self.cfg, "action_samples", 2)
         if action_samples <= 1:
             actions = self.actor.predict_action_chunk(batch)
-            eval_mask = forced_mask.to(self.device) if forced_mask is not None else torch.zeros(
-                actions.shape[:2], dtype=torch.bool, device=self.device
-            )
+            if actions.shape[1] < q_chunk_len:
+                raise ValueError(
+                    f"Policy chunk ({actions.shape[1]}) shorter than q_chunk_len ({q_chunk_len})."
+                )
+            if actions.shape[1] != q_chunk_len:
+                actions = actions[:, :q_chunk_len]
+            if forced_mask is not None:
+                eval_mask = forced_mask.to(self.device).bool()
+                if eval_mask.shape[-1] > q_chunk_len:
+                    eval_mask = eval_mask[..., :q_chunk_len]
+            else:
+                eval_mask = torch.zeros(actions.shape[:2], dtype=torch.bool, device=self.device)
             q_values = self.target_critic(encoding, actions, action_mask=eval_mask, raw_state=raw_state)
             best_q = aggregate_q(q_values, getattr(self.cfg, "q_aggregation", "mean"))
             if return_candidates:
@@ -237,20 +257,23 @@ class QChunkedCritic:
         expanded_batch = repeat_batch(batch, batch_size, action_samples)
         with torch.no_grad():
             expanded_actions = self.actor.predict_action_chunk(expanded_batch)
-        if expanded_actions.shape[1] != self.chunk_size:
-            if expanded_actions.shape[1] < self.chunk_size:
-                raise ValueError(
-                    f"Policy chunk ({expanded_actions.shape[1]}) shorter than critic chunk_size ({self.chunk_size})."
-                )
-            expanded_actions = expanded_actions[:, : self.chunk_size]
+        if expanded_actions.shape[1] < q_chunk_len:
+            raise ValueError(
+                f"Policy chunk ({expanded_actions.shape[1]}) shorter than q_chunk_len ({q_chunk_len})."
+            )
+        if expanded_actions.shape[1] != q_chunk_len:
+            expanded_actions = expanded_actions[:, :q_chunk_len]
         action_dim = expanded_actions.shape[-1]
-        stacked = expanded_actions.view(batch_size, action_samples, self.chunk_size, action_dim)
-        flat_actions = stacked.view(-1, self.chunk_size, action_dim)
+        stacked = expanded_actions.view(batch_size, action_samples, q_chunk_len, action_dim)
+        flat_actions = stacked.view(-1, q_chunk_len, action_dim)
         repeated_encoding = encoding.repeat(action_samples)
         eval_mask = torch.zeros(flat_actions.shape[:2], dtype=torch.bool, device=self.device)
         if forced_mask is not None:
-            forced = forced_mask.to(self.device).bool().view(batch_size, self.chunk_size)
-            eval_mask = forced.unsqueeze(1).expand(-1, action_samples, -1).reshape(-1, self.chunk_size)
+            forced = forced_mask.to(self.device).bool()
+            if forced.shape[-1] > q_chunk_len:
+                forced = forced[..., :q_chunk_len]
+            forced = forced.view(batch_size, q_chunk_len)
+            eval_mask = forced.unsqueeze(1).expand(-1, action_samples, -1).reshape(-1, q_chunk_len)
         raw_state_rep = raw_state.repeat_interleave(action_samples, dim=0)
         q_values = self.target_critic(repeated_encoding, flat_actions, action_mask=eval_mask, raw_state=raw_state_rep)
         q = aggregate_q(q_values, getattr(self.cfg, "q_aggregation", "mean")).view(batch_size, action_samples, -1)
@@ -278,12 +301,13 @@ class QChunkedCritic:
         start = time.perf_counter()
         encoding = self.encode_policy(self.actor, batch).to(self.device)
         actions = batch["action"].to(self.device)
+        q_chunk_len = self.q_chunk_len
         action_mask = get_tensor_from_batch(batch, ["actions_is_pad", "action_is_pad"], default_shape=actions.shape[:2], device=self.device)
 
-        if actions.shape[-2] > self.chunk_size:
-            actions = actions[:, : self.chunk_size]
-        if action_mask.shape[-1] > self.chunk_size:
-            action_mask = action_mask[..., : self.chunk_size]
+        if actions.shape[-2] > q_chunk_len:
+            actions = actions[:, :q_chunk_len]
+        if action_mask.shape[-1] > q_chunk_len:
+            action_mask = action_mask[..., :q_chunk_len]
         action_mask = action_mask.to(self.device).bool()
 
         critic_input_actions = actions.clone()
@@ -294,13 +318,13 @@ class QChunkedCritic:
             critic_input_mask = critic_input_mask & keep_mask
 
         rewards = get_tensor_from_batch(batch, ["rewards"], default_shape=actions.shape[:2], device=self.device)
-        if rewards.ndim > 1 and rewards.shape[-1] > self.chunk_size:
-            rewards = rewards[..., : self.chunk_size]
+        if rewards.ndim > 1 and rewards.shape[-1] > q_chunk_len:
+            rewards = rewards[..., :q_chunk_len]
         rewards = rewards.reshape(actions.shape[0], -1).to(self.device)
 
         reward_is_pad = get_tensor_from_batch(batch, ["reward_is_pad"], default_shape=actions.shape[:2], device=self.device)
-        if reward_is_pad.shape[-1] > self.chunk_size:
-            reward_is_pad = reward_is_pad[..., : self.chunk_size]
+        if reward_is_pad.shape[-1] > q_chunk_len:
+            reward_is_pad = reward_is_pad[..., :q_chunk_len]
 
         returns = discounted_chunk_returns(rewards, reward_is_pad, getattr(self.cfg, "discount", 0.99))
         raw_state = get_raw_state(batch, actions.shape[0], getattr(self.cfg, "raw_state_dim", self._raw_state_dim), self.device)
@@ -319,10 +343,10 @@ class QChunkedCritic:
         valid_lens = valid_lens.to(self.device).long()
         if valid_lens.ndim > 1:
             valid_lens = valid_lens.squeeze(-1)
-        valid_lens = torch.clamp(valid_lens, min=0, max=self.chunk_size)
+        valid_lens = torch.clamp(valid_lens, min=0, max=q_chunk_len)
         pad_flat = next_pad.view(valid_lens.shape[0], -1).any(dim=1)
         valid_lens = valid_lens * (~pad_flat).long()
-        range_tensor = torch.arange(self.chunk_size, device=self.device).unsqueeze(0).expand(valid_lens.shape[0], -1)
+        range_tensor = torch.arange(q_chunk_len, device=self.device).unsqueeze(0).expand(valid_lens.shape[0], -1)
         gt_next_pad_mask = range_tensor >= valid_lens.unsqueeze(1)
 
         with torch.no_grad():
@@ -335,12 +359,12 @@ class QChunkedCritic:
             )
 
         mask = (~next_pad).to(next_q.dtype)
-        bootstrap_discount = getattr(self.cfg, "discount", 0.99) ** self.chunk_size
+        bootstrap_discount = getattr(self.cfg, "discount", 0.99) ** q_chunk_len
         targets = returns + mask * bootstrap_discount * next_q
 
         action_mask = get_tensor_from_batch(batch, ["actions_is_pad", "action_is_pad"], default_shape=actions.shape[:2], device=self.device)
-        if action_mask.shape[-1] > self.chunk_size:
-            action_mask = action_mask[..., : self.chunk_size]
+        if action_mask.shape[-1] > q_chunk_len:
+            action_mask = action_mask[..., :q_chunk_len]
         action_mask = action_mask.to(self.device).bool()
 
         q_values = self.critic(encoding, critic_input_actions, action_mask=critic_input_mask, raw_state=raw_state)
@@ -351,6 +375,7 @@ class QChunkedCritic:
         ood_metrics: Dict[str, float] = {}
         q_ood_tensor = None
         ood_payload = None
+        calql_payload = None
         use_calql = getattr(self.cfg, "use_calql", False)
         use_ood_reg = getattr(self.cfg, "use_ood_reg", False)
         if current_step is not None and current_step < ood_warmup_steps:
@@ -362,18 +387,33 @@ class QChunkedCritic:
         if tau_warmup is not None and current_step is not None and current_step < tau_warmup_steps:
             tau_to_use = tau_warmup
         if use_calql or use_ood_reg:
-            ood_payload = prepare_ood_actions(
-                self, self.actor, batch, actions, next_action_candidates, action_mask, next_pad, raw_state
-            )
+            def _prepare(source: str) -> Dict[str, Any]:
+                if source == "erg":
+                    return prepare_erg_ood_actions(
+                        self, self.actor, batch, actions, next_action_candidates, action_mask, next_pad, raw_state
+                    )
+                if source == "cql":
+                    return prepare_cal_ood_actions(
+                        self, self.actor, batch, actions, next_action_candidates, action_mask, next_pad, raw_state
+                    )
+                raise ValueError(f"Unknown action source '{source}' (expected 'erg' or 'cql').")
+
+            ood_source = str(getattr(self.cfg, "ood_action_source", "erg")).lower().strip()
+            payload = _prepare(ood_source)
+
+            if use_ood_reg:
+                ood_payload = payload
+            if use_calql:
+                calql_payload = payload
 
         if use_ood_reg and ood_payload is not None:
             ood_loss, ood_metrics, q_ood_tensor = compute_explicit_penalty_loss(
                 self, encoding, targets, actions, ood_payload
             )
 
-        if use_calql and ood_payload is not None:
+        if use_calql and calql_payload is not None:
             calql_loss, calql_metrics = compute_calql_loss(
-                self, encoding, q_values, ood_payload
+                self, encoding, q_values, calql_payload
             )
 
         loss_mode = str(getattr(self.cfg, "critic_loss_mode", "mse")).lower()
