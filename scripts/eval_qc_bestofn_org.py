@@ -21,9 +21,6 @@ if str(REPO_ROOT) not in sys.path:
     if LEROBOT_SRC.exists() and str(LEROBOT_SRC) not in sys.path:
         sys.path.insert(0, str(LEROBOT_SRC))
 
-DEFAULT_POLICY_PATH = REPO_ROOT / "pretrained_vla/smolvla/5-shot/pretrained_model"
-DEFAULT_CRITIC_PATH = REPO_ROOT / "outputs/train/12.27/goal_vgas/checkpoints/018000/critic_pretrained_model/last.ckpt"
-
 from libero.libero import benchmark
 from utils import init_logging
 
@@ -35,29 +32,34 @@ from smolvla_qchunk.eval import (
     evaluate_policy_with_best_of_n,
 )
 
-
-def _str2bool(value: str | bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
+# Simple bool parser that accepts true/false/1/0/yes/no.
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    val = str(v).lower()
+    if val in {"yes", "y", "true", "t", "1"}:
         return True
-    if normalized in {"0", "false", "no", "n", "off"}:
+    if val in {"no", "n", "false", "f", "0"}:
         return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: '{value}'")
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate SmolVLA policy with optional critic augmentation")
-    parser.add_argument("--policy-path", type=Path, default=DEFAULT_POLICY_PATH, help="Policy checkpoint directory (pretrained_model)")
-    parser.add_argument("--critic-state", type=Path, default=DEFAULT_CRITIC_PATH, help="Path to critic_state.pt (optional).")
-    parser.add_argument("--use-current-critic", type=_str2bool, default=True, help="Use current critic weights for eval (True/False).")
+    parser.add_argument("--policy-path", default= "",type=Path, help="Policy checkpoint directory (pretrained_model)")
+    parser.add_argument("--critic-state",  type=Path, default="", help="Path to critic_state.pt")
+    parser.add_argument(
+        "--use-current-critic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use current critic (not target_critic) for Best-of-N selection during eval.",
+    )
     parser.add_argument("--env-type", type=str, default="libero")
     env_task_group = parser.add_mutually_exclusive_group()
     env_task_group.add_argument(
         "--env-task",
         type=str,
-        default="libero_object",
+        default="libero_goal",
         help="Single LIBERO suite to evaluate (e.g., libero_object).",
     )
     env_task_group.add_argument(
@@ -75,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--env-task-ids",
         type=int,
         nargs="+",
-        default=None,
+        default=[1,2],
         help="LIBERO task ids to evaluate (e.g. 0 1). Omit to run the first task only.",
     )
     parser.add_argument(
@@ -90,11 +92,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-all-suite-tasks",
+        # default="True",
         action="store_true",
         help="Evaluate all tasks in each selected LIBERO suite (overridden when --suite-task-ids specifies that suite).",
     )
-    parser.add_argument("--eval-batch-size", type=int, default=1)
-    parser.add_argument("--n-episodes", type=int, default=1)
+    parser.add_argument("--eval-batch-size", type=int, default=2)
+    parser.add_argument("--n-episodes", type=int, default=2)
     parser.add_argument("--best-of-n", type=int, default=2)
     parser.add_argument(
         "--use-best-of-n",
@@ -108,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         default="min",
         choices=["mean", "min", "max"],
         help="Override critic q_aggregation during evaluation (defaults to the value stored in the checkpoint).",
+    )
+    parser.add_argument(
+        "--critic-value-head-norm-first",
+        type=_str2bool,
+        default=None,
+        help="Force value head norm-first layout when loading critic (default None = infer from checkpoint).",
     )
     parser.add_argument(
         "--use-data-augmentations",
@@ -130,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--n-action-steps", type=int, default=20)
+    parser.add_argument("--n-action-steps", type=int, default=50)
     args = parser.parse_args()
     try:
         args.suite_task_ids = _parse_suite_task_ids(args.suite_task_ids)
@@ -176,8 +185,10 @@ def main() -> None:
         best_of_n=best_of_n,
         n_action_steps=n_action_steps,
         critic_q_agg_override=args.critic_q_agg_eval,
+        use_data_augmentations=args.use_data_augmentations,
         use_vlm_backbone_encode=args.use_vlm_backbone_encode,
         use_current_critic=args.use_current_critic,
+        # critic_value_head_norm_first=args.critic_value_head_norm_first,
     )
 
     for env_task in env_tasks:
@@ -206,12 +217,15 @@ def main() -> None:
                 n_action_steps=n_action_steps,
                 critic_q_agg_override=args.critic_q_agg_eval,
                 policy_bundle=policy_bundle,
+                use_data_augmentations=args.use_data_augmentations,
                 use_vlm_backbone_encode=args.use_vlm_backbone_encode,
+                use_current_critic=args.use_current_critic,
             )
             info["policy_path"] = str(args.policy_path)
             info["use_best_of_n"] = args.use_best_of_n
             info["env_task"] = env_task
             info["task_id"] = task_id
+            info["use_data_augmentations"] = args.use_data_augmentations
             info["use_vlm_backbone_encode"] = args.use_vlm_backbone_encode
             if args.use_best_of_n and critic_state is not None:
                 info["critic_state_path"] = str(critic_state)
@@ -400,6 +414,13 @@ def _merge_suite_infos(
         overall_summary["eval_ep_s"] = total_eval_ep_time / total_episodes if total_eval_ep_time > 0 else 0.0
     overall_summary["eval_s"] = total_eval_time
 
+    critic_config = None
+    for info in infos:
+        cfg = info.get("critic_config")
+        if cfg is not None:
+            critic_config = cfg
+            break
+
     merged: dict[str, Any] = {
         "per_task": per_task,
         "per_group": per_group,
@@ -414,6 +435,8 @@ def _merge_suite_infos(
 
     if use_best_of_n and critic_state is not None:
         merged["critic_state_path"] = str(critic_state)
+    if critic_config is not None:
+        merged["critic_config"] = critic_config
 
     return merged
 
@@ -474,6 +497,8 @@ def _build_summary(
     total_eval_time = 0.0
     total_eval_ep_time = 0.0
 
+    critic_config = None
+
     for env_task, info in all_infos.items():
         for task_entry in info.get("per_task", []):
             metrics = {
@@ -515,6 +540,8 @@ def _build_summary(
         total_success += overall.get("pc_success", 0.0) / 100.0 * n_eps
         total_eval_time += overall.get("eval_s", 0.0)
         total_eval_ep_time += overall.get("eval_ep_s", 0.0) * n_eps
+        if critic_config is None and "critic_config" in info:
+            critic_config = info["critic_config"]
 
     per_group: dict[str, dict[str, Any]] = {}
     for name, aggregates in per_group_accumulator.items():
@@ -549,6 +576,8 @@ def _build_summary(
 
     if use_best_of_n and critic_state is not None:
         summary["critic_state_path"] = str(critic_state)
+    if critic_config is not None:
+        summary["critic_config"] = critic_config
 
     return summary
 

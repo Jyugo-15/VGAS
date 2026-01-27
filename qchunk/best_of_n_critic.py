@@ -126,10 +126,13 @@ class BestOfNCriticTrainer:
             text_config = _get_text_config(policy)
             if text_config is None:
                 raise ValueError("QChunk Former critic requires access to the policy text_config.")
+            num_head_layers = getattr(cfg, "qformer_num_backbone_layers", None)
+            if num_head_layers is None:
+                num_head_layers = getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2))
             vh_config = ValueHeadConfig(
                 chunk_size=chunk_size,
                 action_dim=action_step_dim,
-                num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
+                num_head_layers=num_head_layers,
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),
@@ -185,6 +188,8 @@ class BestOfNCriticTrainer:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
         print("==================================crtic config==================================")
         print(cfg)
+        print("==================================critic module==================================")
+        print(critic)
         trainer = cls(
             critic,
             target_critic,
@@ -208,38 +213,19 @@ class BestOfNCriticTrainer:
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        def _safe_load(module: nn.Module, payload: Dict[str, Any] | None, label: str) -> None:
+        def _strict_load(module: nn.Module, payload: Dict[str, Any] | None, label: str) -> None:
+            if payload is None:
+                raise ValueError(f"Missing {label} state in checkpoint.")
             if not isinstance(payload, dict):
-                if payload is not None:
-                    module.load_state_dict(payload)
-                return
-            current = module.state_dict()
-            filtered: Dict[str, torch.Tensor] = {}
-            dropped: list[str] = []
-            for key, value in payload.items():
-                if key not in current:
-                    dropped.append(key)
-                    continue
-                if current[key].shape != value.shape:
-                    dropped.append(key)
-                    continue
-                filtered[key] = value
-            if dropped:
-                sample = ", ".join(dropped[:5])
-                logging.warning(
-                    "Skipping %d %s keys due to mismatch (sample: %s)",
-                    len(dropped),
-                    label,
-                    sample,
-                )
-            module.load_state_dict(filtered, strict=False)
+                raise TypeError(f"Expected {label} state_dict dict, got {type(payload)}.")
+            module.load_state_dict(payload, strict=True)
 
         if "critic" in state or "target_critic" in state:
-            _safe_load(self.critic, state.get("critic"), "critic")
-            _safe_load(self.target_critic, state.get("target_critic"), "target_critic")
+            _strict_load(self.critic, state.get("critic"), "critic")
+            _strict_load(self.target_critic, state.get("target_critic"), "target_critic")
         else:
-            _safe_load(self.critic, state, "critic")
-            _safe_load(self.target_critic, state, "target_critic")
+            _strict_load(self.critic, state, "critic")
+            _strict_load(self.target_critic, state, "target_critic")
 
         optim_state = state.get("optimizer")
         if optim_state is not None:
@@ -552,7 +538,7 @@ class BestOfNCriticTrainer:
                 return actions, best_q, candidates
             return actions, best_q
 
-            expanded_batch = repeat_batch(batch, batch_size, action_samples)## b1, b2 = b1,b1,b2,b2
+        expanded_batch = repeat_batch(batch, batch_size, action_samples)## b1, b2 = b1,b1,b2,b2
         
         with torch.no_grad():
             expanded_actions = policy.predict_action_chunk(expanded_batch)

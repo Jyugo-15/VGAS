@@ -20,7 +20,6 @@ from torch import nn
 from qchunk.networks import CriticBackbone
 from qchunk.valuequeryhead import (
     ValueHeadConfig,
-    ValueHeadCritic,
     ValueQueryHead,
     ValueQueryHeadConfig,
     MYQueryValueHeadCritic,
@@ -109,11 +108,11 @@ class ValueQueryCriticAdapter(nn.Module):
 
 
 class ValueHeadCriticAdapter(nn.Module):
-    """Wrap one or more ValueHeadCritic modules and expose a twin-Q style interface."""
+    """Wrap one or more value-head critics and expose a twin-Q style interface."""
 
-    def __init__(self, heads: Sequence[ValueHeadCritic] | ValueHeadCritic):
+    def __init__(self, heads: Sequence[nn.Module] | nn.Module):
         super().__init__()
-        if isinstance(heads, ValueHeadCritic):
+        if isinstance(heads, nn.Module):
             heads = [heads]
         if len(heads) == 0:
             raise ValueError("ValueHeadCriticAdapter requires at least one head.")
@@ -268,30 +267,34 @@ class BestOfNCriticTrainer:
             text_config = _get_text_config(policy)
             if text_config is None:
                 raise ValueError("ValueHead critic requires access to the policy text_config.")
+            num_head_layers = getattr(cfg, "qformer_num_backbone_layers", None)
+            if num_head_layers is None:
+                num_head_layers = getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2))
             vh_config = ValueHeadConfig(
                 chunk_size=chunk_size,
                 action_dim=action_step_dim,
-                num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
+                num_head_layers=num_head_layers,
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),
             )
-            head = ValueHeadCritic(vh_config, text_config=text_config)
+            head = MYQueryValueHeadCritic(vh_config, text_config=text_config)
             critic = ValueHeadCriticAdapter(head).to(device)
         elif critic_type == "my_value_query_head":
             text_config = _get_text_config(policy)
             if text_config is None:
                 raise ValueError("MY ValueQueryHead critic requires access to the policy text_config.")
-            use_no_query_head = getattr(cfg, "use_no_query_head", False)
 
+            num_head_layers = getattr(cfg, "qformer_num_backbone_layers", None)
+            if num_head_layers is None:
+                num_head_layers = getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2))
             vh_config = ValueHeadConfig(
                 chunk_size=chunk_size,
                 action_dim=action_step_dim,
-                num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
+                num_head_layers=num_head_layers,
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),
-                num_query_token=getattr(cfg, "num_query_token", 16),
                 use_raw_state_fusion=getattr(cfg, "use_raw_state_fusion", False),
                 raw_state_dim=getattr(cfg, "raw_state_dim", 8),
                 bias_init_enabled=getattr(cfg, "value_head_bias_init_enabled", False),
@@ -301,7 +304,7 @@ class BestOfNCriticTrainer:
             if num_q_heads < 1:
                 raise ValueError("Value head critic requires at least one head (num_q_heads >= 1).")
             heads = [
-                MYQueryValueHeadCritic(vh_config, text_config=text_config, use_no_query_head=use_no_query_head)
+                MYQueryValueHeadCritic(vh_config, text_config=text_config)
                 for _ in range(num_q_heads)
             ]
             critic = ValueHeadCriticAdapter(heads).to(device)
@@ -642,7 +645,7 @@ class BestOfNCriticTrainer:
             mc_lower_bound = mc_lower_bound[:, 0]
 
         next_action_candidates = next_action_candidates.to(self.device)
-        ood_m_actions = getattr(self.cfg, "cql_m_actions", None)
+        ood_m_actions = getattr(self.cfg, "ood_m_actions", None)
         if ood_m_actions is None:
             ood_m_actions = next_action_candidates.shape[1]
         ood_m_actions = max(1, min(ood_m_actions, next_action_candidates.shape[1]))

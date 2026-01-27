@@ -421,47 +421,12 @@ class ValueHeadConfig:
     head_mlp_dims: Sequence[int] = (512, 512)
     vlm_model_name: str | None = None
     att_mode: str = "causal"
-    num_query_token: int = 16
     use_raw_state_fusion: bool = False
     raw_state_dim: int = 8
     bias_init_enabled: bool = False
     bias_init_value: float = 0.0
 
 
-class ValueHeadCritic(nn.Module):
-    """Critic that consumes prefix tokens directly via a transformer head."""
-
-    def __init__(self, config: ValueHeadConfig, text_config: LlamaConfig | None = None):
-        super().__init__()
-        if text_config is None and config.vlm_model_name is None:
-            raise ValueError("ValueHeadCritic requires text_config or vlm_model_name.")
-        self.head = TransformerCriticHead(
-            hidden_dim=(text_config.hidden_size if text_config is not None else None),
-            action_dim=config.action_dim,
-            num_layers=config.num_head_layers,
-            mlp_hidden_dims=config.head_mlp_dims,
-            model_id=config.vlm_model_name,
-            text_config=text_config,
-            att_mode=config.att_mode,
-        )
-
-    def forward_from_embeddings(
-        self,
-        prefix_embs: torch.Tensor,
-        pad_masks: torch.Tensor,
-        att_masks: torch.Tensor,
-        actions: torch.Tensor,
-        actions_is_pad: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.head(
-            prefix_embs=prefix_embs,
-            pad_masks=pad_masks,
-            att_masks=att_masks,
-            query_emb=None,
-            actions=actions,
-            actions_is_pad=actions_is_pad,
-        )
-    
 class Qchunk_Former(nn.Module):
     """Critic that consumes prefix tokens directly via a transformer head."""
 
@@ -619,13 +584,14 @@ class Q_Former(nn.Module):
         layers: list[nn.Module] = []
         prev_dim = self.hidden_dim
         total_layers = len(mlp_hidden_dims)
+        # print("total_layers", total_layers)
         for idx, hidden in enumerate(mlp_hidden_dims):
             layers.append(nn.Linear(prev_dim, hidden))
             if idx  < total_layers:
                 
-                layers.append(nn.LayerNorm(hidden))
+                
                 layers.append(nn.GELU())
-                layers.append(nn.Dropout(0.1))
+                layers.append(nn.LayerNorm(hidden))
 
                 # layers.append(nn.GELU())
                 # layers.append(nn.LayerNorm(hidden))

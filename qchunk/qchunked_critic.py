@@ -108,10 +108,13 @@ class QChunkedCritic:
         elif critic_type == "q_chunk_former":
             text_config = getattr(getattr(getattr(policy, "model", None), "vlm_with_expert", None), "config", None)
             text_config = getattr(text_config, "text_config", None)
+            num_head_layers = getattr(cfg, "qformer_num_backbone_layers", None)
+            if num_head_layers is None:
+                num_head_layers = getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2))
             vh_config = ValueHeadConfig(
                 chunk_size=q_chunk_len,
                 action_dim=action_step_dim,
-                num_head_layers=getattr(cfg, "value_head_num_layers", getattr(cfg, "head_num_layers", 2)),
+                num_head_layers=num_head_layers,
                 head_mlp_dims=getattr(cfg, "value_head_mlp_dims", getattr(cfg, "head_mlp_dims", (512, 512))),
                 vlm_model_name=getattr(cfg, "value_head_vlm_model_name", getattr(cfg, "vqh_vlm_model_name", None)),
                 att_mode=getattr(cfg, "att_mode", "causal"),

@@ -70,6 +70,8 @@ else:
             include_future_observation: bool = True,
             max_action_dim: int | None = None,
             discount: float = 0.99,
+            allow_missing_reward: bool = False,
+            mlp_critic: bool = False,
             **kwargs,
         ) -> None:
             delta_timestamps = kwargs.get("delta_timestamps")
@@ -105,10 +107,12 @@ else:
             self._episode_cache: OrderedDict[int, Dict[str, Any]] = OrderedDict()
             self._mirrored_reward_delta = mirrored_reward_delta
             self.chunk_size = max(1, int(chunk_size))
-            self.q_chunk_len = int(q_chunk_len)
+            self.q_chunk_len = int(q_chunk_len) if q_chunk_len is not None else self.chunk_size
             self.include_future_observation = include_future_observation
             self.max_action_dim = max_action_dim
             self.discount = float(discount)
+            self.allow_missing_reward = allow_missing_reward
+            self.mlp_critic = bool(mlp_critic)
 
             if mirrored_reward_delta:
                 logging.info(
@@ -143,7 +147,10 @@ else:
                 self._index_to_episode.extend([ep_idx] * length)
 
                 if self.chunk_size > 1:
-                    max_start = max(1, length)
+                    if self.mlp_critic:
+                        max_start = max(0, length - self.q_chunk_len + 1)
+                    else:
+                        max_start = max(1, length)
                     for offset in range(max_start):
                         self._window_indices.append((ep_idx, start + offset))
 
@@ -318,7 +325,14 @@ else:
             desired = start_index + self.q_chunk_len  # use separate critic/future chunk
             pad = desired >= end
             target = min(max(start, desired), max(start, end - 1))
-            future = super(RewardAugmentedLeRobotDataset, self).__getitem__(target)
+            try:
+                future = super(RewardAugmentedLeRobotDataset, self).__getitem__(target)
+            except KeyError:
+                if not self.allow_missing_reward:
+                    raise
+                row = self.hf_dataset[int(target)]
+                future = dict(row)
+                future.setdefault(self.reward_key, 0.0)
             obs = self._extract_observations(future)
             if pad:
                 for key in list(obs.keys()):
@@ -331,10 +345,30 @@ else:
 
         def __getitem__(self, index: int) -> Dict[str, Any]:
             if self.chunk_size <= 1 or not self._window_indices:
-                return super(RewardAugmentedLeRobotDataset, self).__getitem__(index)
+                try:
+                    return super(RewardAugmentedLeRobotDataset, self).__getitem__(index)
+                except KeyError:
+                    if not self.allow_missing_reward:
+                        raise
+                    row = self.hf_dataset[int(index)]
+                    sample = dict(row)
+                    sample.setdefault(self.reward_key, 0.0)
+                    return sample
 
             episode_index, global_start = self._window_indices[index]
-            base_sample = super(RewardAugmentedLeRobotDataset, self).__getitem__(global_start)
+            try:
+                base_sample = super(RewardAugmentedLeRobotDataset, self).__getitem__(global_start)
+            except KeyError:
+                if not self.allow_missing_reward:
+                    raise
+                row = self.hf_dataset[int(global_start)]
+                base_sample = dict(row)
+                base_sample.setdefault(self.reward_key, 0.0)
+                try:
+                    task_idx = base_sample["task_index"].item()
+                    base_sample["task"] = self.meta.tasks.iloc[task_idx].name
+                except Exception:
+                    pass
 
             chunk = self._gather_chunk(episode_index, global_start)
             base_sample.update(chunk)

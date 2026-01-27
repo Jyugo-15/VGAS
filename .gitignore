@@ -2,4 +2,9 @@
 /pretrained_vla/
 /output/
 /dataset/
-./vscode
+/.vscode/
+/outputs/
+/test_log/
+*.pyc
+__pycache__/
+/logs/

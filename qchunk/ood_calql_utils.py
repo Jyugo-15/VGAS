@@ -51,7 +51,7 @@ def prepare_cal_ood_actions(
         mc_lower_bound = None
 
     next_action_candidates = next_action_candidates.to(trainer.device)
-    ood_m_actions = getattr(cfg, "cql_m_actions", None)
+    ood_m_actions = getattr(cfg, "ood_m_actions", None)
     if ood_m_actions is None:
         ood_m_actions = next_action_candidates.shape[1]
     ood_m_actions = max(1, min(ood_m_actions, next_action_candidates.shape[1]))
@@ -304,7 +304,7 @@ def prepare_erg_ood_actions(
         mc_lower_bound = None
 
     next_action_candidates = next_action_candidates.to(trainer.device)
-    ood_m_actions = getattr(cfg, "cql_m_actions", None)
+    ood_m_actions = getattr(cfg, "ood_m_actions", None)
     if ood_m_actions is None:
         ood_m_actions = next_action_candidates.shape[1]
     ood_m_actions = max(1, min(ood_m_actions, next_action_candidates.shape[1]))
@@ -589,12 +589,82 @@ def compute_explicit_penalty_loss(
     else:
         win_trunc = float((q_batch.view(-1, 1) > q_ood.max(dim=1, keepdim=True).values).float().mean().item())
 
+    with torch.no_grad():
+        q_ood_det = q_ood.detach()
+        dist_det = dist.detach()
+        idx_pol = m_policy
+        idx_noise_start = idx_pol
+        idx_noise_end = idx_noise_start + m_noise
+        idx_mix_start = idx_noise_end
+        idx_mix_end = idx_mix_start + m_mix
+        idx_trunc = idx_mix_end
+
+        q_policy_mean = q_ood_det[:, :idx_pol].mean().item() if idx_pol > 0 else 0.0
+        q_prec_mean = (
+            q_ood_det[:, idx_noise_start:idx_noise_end].mean().item()
+            if idx_noise_end > idx_noise_start
+            else 0.0
+        )
+        q_mix_mean = (
+            q_ood_det[:, idx_mix_start:idx_mix_end].mean().item()
+            if idx_mix_end > idx_mix_start
+            else 0.0
+        )
+        q_trunc_mean = (
+            q_ood_det[:, idx_trunc:].mean().item()
+            if m_trunc > 0 and idx_trunc < q_ood_det.shape[1]
+            else 0.0
+        )
+        dist_policy_mean = dist_det[:, :idx_pol].mean().item() if idx_pol > 0 else 0.0
+        dist_prec_mean = (
+            dist_det[:, idx_noise_start:idx_noise_end].mean().item()
+            if idx_noise_end > idx_noise_start
+            else 0.0
+        )
+        dist_mix_mean = (
+            dist_det[:, idx_mix_start:idx_mix_end].mean().item()
+            if idx_mix_end > idx_mix_start
+            else 0.0
+        )
+        dist_trunc_mean = (
+            dist_det[:, idx_trunc:].mean().item()
+            if m_trunc > 0 and idx_trunc < dist_det.shape[1]
+            else 0.0
+        )
+
+        align_top1 = 0.0
+        align_rank = 0.0
+        if idx_pol > 0:
+            dist_policy = dist_det[:, :idx_pol]
+            q_policy = q_ood_det[:, :idx_pol]
+            best_sim_idx = torch.argmin(dist_policy, dim=1)
+            best_q_idx = torch.argmax(q_policy, dim=1)
+            align_top1 = float((best_sim_idx == best_q_idx).float().mean().item())
+            q_ranking = torch.argsort(q_policy, dim=1, descending=True)
+            rank_pos = torch.argmax((q_ranking == best_sim_idx.unsqueeze(1)).float(), dim=1)
+            align_rank = float(rank_pos.float().mean().item())
+
     metrics = {
         "ood_loss": float(loss_ood.item()),
-        "ood_q_mean": float(q_ood.mean().item()),
+        "ood_loss_total": float(loss_ood.item()),
+        "ood_loss_anchor": float(loss_anchor.item()),
+        "ood_loss_rank": float(loss_rank.item()),
+        "ood_q_mean": float(q_ood_det.mean().item()),
+        "ood_dist_mean": float(dist_det.mean().item()),
         "ood_target_mean": float(target_ood.mean().item()),
         "win_rate/gt_vs_policy": win_policy,
         "win_rate/gt_vs_trunc": win_trunc,
+        "align/top1_policy_best_sim": align_top1,
+        "align/rank_policy_best_sim": align_rank,
+        "q_val/ood_avg": float(q_ood_det.mean().item()),
+        "q_val/ood_policy": q_policy_mean,
+        "q_val/ood_prec": q_prec_mean,
+        "q_val/ood_mix": q_mix_mean,
+        "q_val/ood_trunc": q_trunc_mean,
+        "dist/policy": dist_policy_mean,
+        "dist/prec": dist_prec_mean,
+        "dist/mix": dist_mix_mean,
+        "dist/trunc": dist_trunc_mean,
     }
     if loss_rank is not None:
         metrics["ood_loss_pairwise_raw"] = float(loss_rank.item())

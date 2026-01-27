@@ -58,10 +58,8 @@ def evaluate_policy_with_best_of_n(
     best_of_n: int = 1,
     videos_dir: Path | None = None,
     max_render: int = 0,
-    policy_n_action_steps: int = 10,
-    exec_n_action_steps: int | None = None,
+    n_action_steps: int = 10,
     critic_q_agg_override: str | None = None,
-    use_data_augmentations: bool = False,
     use_vlm_backbone_encode: bool = True,
     policy_bundle: PolicyEvalBundle | None = None,
     use_current_critic: bool = False,
@@ -80,7 +78,6 @@ def evaluate_policy_with_best_of_n(
         else lambda p, b: encode_policy_observations(
             p,
             b,
-            use_data_augmentations=use_data_augmentations,
             use_vlm_backbone_encode=use_vlm_backbone_encode,
         )
     )
@@ -88,7 +85,7 @@ def evaluate_policy_with_best_of_n(
     if policy_bundle is None:
         policy_cfg = _load_policy_config(policy_path)
         policy_cfg.device = device
-        policy_cfg.n_action_steps = policy_n_action_steps
+        policy_cfg.n_action_steps = n_action_steps
         policy = make_policy(cfg=policy_cfg, env_cfg=env_cfg)
         ########################
         print(f"policy_cfg.n_action_steps:  {policy_cfg.n_action_steps}")
@@ -102,7 +99,6 @@ def evaluate_policy_with_best_of_n(
         )
 
         critic_trainer = None
-        exec_action_steps = exec_n_action_steps or policy_n_action_steps
         if critic_state_path is not None:
             critic_trainer = _build_eval_critic(
                 policy=policy,
@@ -129,23 +125,20 @@ def evaluate_policy_with_best_of_n(
         encoder_fn = policy_bundle.encoder_fn
         policy.reset()
         policy.eval()
-        exec_action_steps = exec_n_action_steps or policy_n_action_steps
         if best_of_n > 1 and critic_state_path is not None and critic_trainer is None:
             logging.warning("Best-of-N requested but critic checkpoint was not found. Falling back to BC.")
         if best_of_n > 1 and critic_state_path is None and critic_trainer is None:
             logging.warning("Best-of-N requested but no critic checkpoint provided. Falling back to BC.")
-    if exec_action_steps is None:
-        raise ValueError("exec_n_action_steps or policy_n_action_steps must be provided for evaluation.")
+    if n_action_steps is None:
+        raise ValueError("n_action_steps must be provided for evaluation.")
     needs_critic_patch = best_of_n > 1 and critic_trainer is not None
-    needs_exec_patch = exec_action_steps != policy_n_action_steps
     already_patched = getattr(policy, "_best_of_n_patched", False)
-    prev_exec_steps = getattr(policy, "_exec_n_action_steps", None)
-    if (needs_critic_patch or needs_exec_patch) and (not already_patched or prev_exec_steps != exec_action_steps):
+    if needs_critic_patch and not already_patched:
         _patch_policy_select_action(
             policy,
             critic_trainer if needs_critic_patch else None,
             encoder_fn,
-            exec_n_action_steps=exec_action_steps,
+            n_action_steps=n_action_steps,
         )
 
     videos_path = None
@@ -156,19 +149,18 @@ def evaluate_policy_with_best_of_n(
     device_type = torch.device(device).type
     with torch.no_grad(), torch.autocast(device_type=device_type, enabled=use_amp):
         info = eval_policy_all(
-            envs=envs,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=n_episodes,
-            max_episodes_rendered=max_render,
-            videos_dir=videos_path,
-            start_seed=seed,
-            max_parallel_tasks=getattr(env_cfg, "max_parallel_tasks", batch_size),
-        )
+                envs=envs,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                n_episodes=n_episodes,
+                max_episodes_rendered=max_render,
+                videos_dir=videos_path,
+                start_seed=seed,
+                max_parallel_tasks=getattr(env_cfg, "max_parallel_tasks", batch_size),
+            )
     policy_config = getattr(policy, "config", None)
-    info["policy_n_action_steps"] = getattr(policy_config, "n_action_steps", None)
-    info["exec_n_action_steps"] = exec_action_steps
+    info["n_action_steps"] = getattr(policy_config, "n_action_steps", None)
 
     close_envs(envs)
     return info
@@ -179,7 +171,7 @@ def _patch_policy_select_action(
     critic_trainer: BestOfNCriticTrainer | None,
     encoder_fn: Callable[[Any, dict[str, torch.Tensor]], Any],
     *,
-    exec_n_action_steps: int,
+    n_action_steps: int,
 ) -> None:
     """Replace the policy select_action with a critic-guided version."""
 
@@ -194,19 +186,12 @@ def _patch_policy_select_action(
             else:
                 actions = self.predict_action_chunk(batch)
             per_step_actions = actions.transpose(0, 1)
-            exec_steps = min(exec_n_action_steps, per_step_actions.shape[0])
-            if exec_steps < exec_n_action_steps:
-                logging.warning(
-                    "Requested exec_n_action_steps=%s exceeds available chunk=%s; truncating.",
-                    exec_n_action_steps,
-                    per_step_actions.shape[0],
-                )
+            exec_steps = min(n_action_steps, per_step_actions.shape[0])
             self._queues[ACTION].extend(per_step_actions[:exec_steps])
         return self._queues[ACTION].popleft()
 
     policy.select_action = MethodType(select_action_with_critic, policy)
     setattr(policy, "_best_of_n_patched", True)
-    setattr(policy, "_exec_n_action_steps", exec_n_action_steps)
 
 
 def _build_eval_critic(
@@ -228,7 +213,6 @@ def _build_eval_critic(
     ckpt.config.action_samples = max(best_of_n, 1)
     if critic_q_agg_override is not None:
         ckpt.config.q_aggregation = critic_q_agg_override
-
     sample_batch, sample_size = _sample_policy_batch(envs, preprocessor, device, policy)
     builder_batch = dict(sample_batch)
     builder_batch["action"] = _dummy_action_tensor(policy, sample_size, device)
@@ -252,7 +236,7 @@ def _build_eval_critic(
 
 
 def _dummy_action_tensor(policy: Any, batch_size: int, device: str) -> torch.Tensor:
-    chunk_size = getattr(policy.config, "n_action_steps", 1)
+    chunk_size = getattr(policy.config, "chunk_size", 1)
     action_dim = _infer_action_dim(policy)
     return torch.zeros(batch_size, chunk_size, action_dim, device=device)
 
@@ -320,17 +304,67 @@ def _maybe_to_device(value: Any, device: str):
     return value
 
 
+def _normalize_critic_config(cfg_dict: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(cfg_dict, dict):
+        return None
+
+    def _convert(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_convert(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_convert(v) for v in value)
+        return value
+
+    normalized = _convert(cfg_dict)
+    if "ood_source" in normalized and "ood_action_source" not in normalized:
+        normalized["ood_action_source"] = normalized["ood_source"]
+    if "vqh_num_backbone_layers" in normalized and "qformer_num_backbone_layers" not in normalized:
+        normalized["qformer_num_backbone_layers"] = normalized["vqh_num_backbone_layers"]
+    if "cql_m_actions" in normalized and "ood_m_actions" not in normalized:
+        normalized["ood_m_actions"] = normalized["cql_m_actions"]
+    if "pairwise_ood_loss_weight" in normalized and "loss_rank_weight" not in normalized:
+        normalized["loss_rank_weight"] = normalized["pairwise_ood_loss_weight"]
+    if "use_pairwise_ood_loss" in normalized:
+        if not normalized["use_pairwise_ood_loss"]:
+            normalized["loss_rank_weight"] = 0.0
+        normalized.pop("use_pairwise_ood_loss", None)
+
+    allowed = set(CriticConfig.__dataclass_fields__.keys())
+    return {key: value for key, value in normalized.items() if key in allowed}
+
+
+def _load_critic_config_file(checkpoint_path: Path) -> dict[str, Any] | None:
+    candidates = []
+    if checkpoint_path.is_file():
+        candidates.append(checkpoint_path.parent / "config.json")
+    if checkpoint_path.is_dir():
+        candidates.append(checkpoint_path / "config.json")
+        candidates.append(checkpoint_path / "critic_pretrained_model" / "config.json")
+    for candidate in candidates:
+        if candidate.exists():
+            with candidate.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    return None
+
+
 def _load_critic_checkpoint(path: Path) -> CriticCheckpoint:
-    payload = torch.load(path, map_location="cpu")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    config_payload = _load_critic_config_file(path)
     if "state_dict" in payload:
         state_dict = payload["state_dict"]
-        cfg_dict = payload.get("critic_config")
+        cfg_dict = config_payload if config_payload is not None else payload.get("critic_config")
         meta = payload.get("meta", {})
     else:
         state_dict = payload
-        cfg_dict = None
+        cfg_dict = config_payload
         meta = {}
-    cfg = CriticConfig(**cfg_dict) if isinstance(cfg_dict, dict) else CriticConfig()
+    print("org config", cfg_dict)
+    normalized_cfg = _normalize_critic_config(cfg_dict)
+    cfg = CriticConfig(**normalized_cfg) if normalized_cfg is not None else CriticConfig()
     return CriticCheckpoint(state_dict=state_dict, config=cfg, meta=meta)
 
 
@@ -356,10 +390,8 @@ def build_policy_eval_bundle(
     sample_batch_size: int,
     device: str,
     best_of_n: int = 1,
-    policy_n_action_steps: int = 10,
-    exec_n_action_steps: int | None = None,
+    n_action_steps: int = 10,
     critic_q_agg_override: str | None = None,
-    use_data_augmentations: bool = False,
     use_vlm_backbone_encode: bool = True,
     use_current_critic: bool = False,
 ) -> PolicyEvalBundle:
@@ -367,7 +399,7 @@ def build_policy_eval_bundle(
     print(policy_path)
     policy_cfg = _load_policy_config(policy_path)
     policy_cfg.device = device
-    policy_cfg.n_action_steps = policy_n_action_steps
+    policy_cfg.n_action_steps = n_action_steps
     policy = make_policy(cfg=policy_cfg, env_cfg=sample_env_cfg)
     policy.eval()
 
@@ -382,13 +414,11 @@ def build_policy_eval_bundle(
     encoder_fn = lambda p, b: encode_policy_observations(
         p,
         b,
-        use_data_augmentations=use_data_augmentations,
         use_vlm_backbone_encode=use_vlm_backbone_encode,
     )
     critic_trainer = None
-    exec_action_steps = exec_n_action_steps or policy_n_action_steps
-    if exec_action_steps is None:
-        raise ValueError("exec_n_action_steps or policy_n_action_steps must be provided for evaluation.")
+    if n_action_steps is None:
+        raise ValueError("n_action_steps must be provided for evaluation.")
     if critic_state_path is not None:
         critic_trainer = _build_eval_critic(
             policy=policy,
@@ -397,16 +427,16 @@ def build_policy_eval_bundle(
             critic_ckpt_path=critic_state_path,
             device=device,
             best_of_n=best_of_n,
-            critic_q_agg_override=critic_q_agg_override,
-            encoder_fn=encoder_fn,
-            use_current_critic=use_current_critic,
-        )
+                critic_q_agg_override=critic_q_agg_override,
+                encoder_fn=encoder_fn,
+                use_current_critic=use_current_critic,
+            )
         if critic_trainer is not None and best_of_n > 1:
             _patch_policy_select_action(
                 policy,
                 critic_trainer,
                 encoder_fn,
-                exec_n_action_steps=exec_action_steps,
+                n_action_steps=n_action_steps,
             )
     close_envs(envs)
 

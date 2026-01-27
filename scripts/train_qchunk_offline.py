@@ -96,7 +96,7 @@ class CriticConfig:
     action_samples: int = 8
     q_aggregation: str = "mean"  # {"mean", "min", "max"}
     use_calql: bool = False
-    cql_m_actions: Optional[int] = None
+    ood_m_actions: Optional[int] = None
     cql_alpha: float = 1.0
     cql_next_noise_std: float = 0.05
     cql_cur_noise_std: Optional[float] = None
@@ -121,7 +121,7 @@ class CriticConfig:
     loss_rank_weight: float = 1.0
     num_query_token: int = 16
     critic_type: str = "mlp"  # {"mlp", "q_chunk_former"}
-    vqh_num_backbone_layers: int = 2
+    qformer_num_backbone_layers: int = 2
     vqh_hidden_dims: tuple[int, ...] = (512, 512)
     vqh_vlm_model_name: Optional[str] = None
     att_mode: str = "causal"
@@ -200,6 +200,7 @@ def _build_reward_augmented_dataset(cfg: TrainWithCriticPipelineConfig):
         max_action_dim=getattr(cfg.policy, "max_action_dim", None),
         video_backend=cfg.dataset.video_backend,
         discount=getattr(cfg.dataset, "discount", getattr(cfg.critic, "discount", 0.99)),
+        allow_missing_reward=getattr(cfg.dataset, "allow_missing_reward", False),
     )
     return dataset
 
@@ -895,9 +896,21 @@ def train(cfg: TrainWithCriticPipelineConfig):
                 train_metrics[key] = AverageMeter(short, ":.3f")
         ood_metric_names = [
             ("ood_loss", "ood_loss"),
+            ("ood_loss_total", "ood_loss_t"),
+            ("ood_loss_anchor", "ood_loss_a"),
+            ("ood_loss_rank", "ood_loss_r"),
             ("ood_q_mean", "ood_q"),
             ("ood_dist_mean", "ood_dist"),
             ("ood_target_mean", "ood_tgt"),
+            ("q_val/ood_avg", "q_ood_avg"),
+            ("q_val/ood_policy", "q_ood_pol"),
+            ("q_val/ood_prec", "q_ood_prec"),
+            ("q_val/ood_mix", "q_ood_mix"),
+            ("q_val/ood_trunc", "q_ood_trunc"),
+            ("dist/policy", "d_pol"),
+            ("dist/prec", "d_prec"),
+            ("dist/mix", "d_mix"),
+            ("dist/trunc", "d_trunc"),
         ]
         for key, short in ood_metric_names:
             train_metrics[key] = AverageMeter(short, ":.3f")
@@ -1138,6 +1151,18 @@ def _critic_state_path(checkpoint_dir: Path) -> Path:
     return checkpoint_dir / TRAINING_STATE_DIR / CRITIC_STATE_FILE
 
 
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(val) for val in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def save_critic_state(critic: Optional[QChunkedCritic], checkpoint_dir: Path) -> None:
     if critic is None:
         return
@@ -1153,7 +1178,11 @@ def save_critic_state(critic: Optional[QChunkedCritic], checkpoint_dir: Path) ->
     }
     cfg = getattr(critic, "cfg", None)
     if cfg is not None and is_dataclass(cfg):
-        payload["critic_config"] = asdict(cfg)
+        cfg_dict = asdict(cfg)
+        payload["critic_config"] = cfg_dict
+        config_path = critic_path / "config.json"
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(_to_jsonable(cfg_dict), f, indent=2, sort_keys=True)
     torch.save(payload, last_state)
 
 

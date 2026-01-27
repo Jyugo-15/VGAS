@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-freq", type=int, default=0, help="Evaluation frequency during training (0 disables).")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision.")
     parser.add_argument("--streaming", action="store_true", help="Enable streaming dataset loading mode.")
+    parser.add_argument("--allow-missing-reward", type=str2bool, default=True, help="Allow datasets without reward/terminal by filling zeros.")
     parser.add_argument("--expert-width-multiplier", type=float, default=None, help="Width multiplier for the LM/expert layers (must match checkpoint).")
     parser.add_argument("--disable-save-checkpoint", action="store_true", help="Disable checkpoint saving even if LeRobot would normally save.")
 
@@ -158,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic-head-num-layers", type=int, default=2, help="Number of transformer layers for the critic head when applicable.")
     parser.add_argument("--critic-head-mlp-dims", type=int, nargs="+", default=None, help="MLP dimensions used inside the critic head (defaults to critic hidden dims).")
     parser.add_argument("--critic-vqh-hidden-dims", type=int, nargs="+", default=None, help="Hidden dims for ValueQueryHead backbones (defaults to critic hidden dims).")
-    parser.add_argument("--critic-vqh-num-backbone-layers", type=int, default=2, help="Number of decoder layers for ValueQueryHead backbones.")
+    parser.add_argument("--critic-qformer-num-backbone-layers", "--critic-vqh-num-backbone-layers", type=int, default=2, help="Number of decoder layers for QFormer backbones.")
     parser.add_argument("--critic-vqh-vlm-model-name", type=str, default=None, help="Override the VLM model name used when instantiating ValueQueryHead backbones.")
     parser.add_argument("--critic-num-q-heads", type=int, default=2, help="Number of independent Q heads when using ValueQueryHead critics.")
     parser.add_argument("--critic-loss-mode", type=str, default="per_head_mean", choices=["mse", "per_head_mean"], help="Reduction applied to critic TD errors.")
@@ -192,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-mix-dist", type=str2bool, default=False, help="Log debug stats for OOD mixing distances.")
     parser.add_argument("--loss-anchor-weight", type=float, default=1.0, help="Weight for anchor OOD loss term.")
     parser.add_argument("--loss-rank-weight", type=float, default=1.0, help="Weight for pairwise OOD loss term.")
-    parser.add_argument("--cql-m-actions", type=int, default=2, help="Number of CQL samples (defaults to all best-of-n candidates).")
+    parser.add_argument("--ood-m-actions",dest="ood_m_actions",type=int,default=2,help="Number of OOD action samples (defaults to all best-of-n candidates).")
     parser.add_argument("--cql-alpha", type=float, default=1.0, help="Weight for CalQL/CQL regularization term.")
     parser.add_argument("--cql-next-noise-std", type=float, default=0.05, help="Std for CalQL next-action noise (set 0 to disable).")
     parser.add_argument("--cql-cur-noise-std", type=float, default=None, help="Std for CalQL current-action noise (defaults to next noise std; set 0 to disable).")
@@ -269,7 +270,7 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
         q_aggregation=args.critic_q_agg,
         temperature=args.critic_temperature,
         critic_type=args.critic_type,
-        vqh_num_backbone_layers=args.critic_vqh_num_backbone_layers,
+        qformer_num_backbone_layers=args.critic_qformer_num_backbone_layers,
         vqh_hidden_dims=vqh_hidden_dims,
         vqh_vlm_model_name=args.critic_vqh_vlm_model_name,
         head_type=args.critic_head_type,
@@ -286,7 +287,7 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
         lr_total_steps=args.critic_total_steps or args.steps,
         lr_final=args.critic_lr_final,
         use_calql=args.use_calql,
-        cql_m_actions=args.cql_m_actions,
+        ood_m_actions=args.ood_m_actions,
         cql_alpha=args.cql_alpha,
         cql_next_noise_std=args.cql_next_noise_std,
         cql_cur_noise_std=(
@@ -377,6 +378,7 @@ def build_train_config(args: argparse.Namespace) -> TrainWithCriticPipelineConfi
         episodes=args.episodes,
         streaming=args.streaming,
     )
+    dataset_cfg.allow_missing_reward = args.allow_missing_reward
 
     wandb_cfg = WandBConfig(
         enable=args.wandb,
@@ -431,7 +433,6 @@ def build_train_config(args: argparse.Namespace) -> TrainWithCriticPipelineConfi
     if args.use_calql:
         train_cfg.critic.use_calql = True
     # Toggles forwarded to encode_policy_observations_test
-    train_cfg.use_data_augmentations = args.use_data_augmentations
     train_cfg.use_vlm_backbone_encode = args.use_vlm_backbone_encode
     train_cfg.critic_only = args.critic_only
     return train_cfg
