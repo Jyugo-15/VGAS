@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
@@ -27,13 +28,26 @@ DEFAULT_CRITIC_PATH = REPO_ROOT / "outputs/train/12.27/goal_vgas/checkpoints/018
 from libero.libero import benchmark
 from utils import init_logging
 
-from lerobot.envs.configs import LiberoEnv
+from lerobot.envs.configs import EnvConfig, LiberoEnv
 
 from smolvla_qchunk.eval import (
     PolicyEvalBundle,
     build_policy_eval_bundle,
     evaluate_policy_with_best_of_n,
 )
+
+
+@EnvConfig.register_subclass("libero_compat")
+@dataclass
+class LiberoEnvCompat(LiberoEnv):
+    selected_task_ids: tuple[int, ...] | None = None
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs = dict(super().gym_kwargs)
+        if self.selected_task_ids is not None:
+            kwargs["task_ids"] = list(self.selected_task_ids)
+        return kwargs
 
 
 def _str2bool(value: str | bool) -> bool:
@@ -142,7 +156,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     init_logging()
-    logging.info(pformat(vars(args)))
     if not args.use_best_of_n:
         logging.info("Best-of-N disabled; running plain SmolVLA policy.")
     critic_state = args.critic_state if args.use_best_of_n else None
@@ -263,13 +276,13 @@ def _build_env_config(
         else:
             task_ids = tuple(args.env_task_ids) if args.env_task_ids is not None else (0,)
     task = task_name if task_name is not None else args.env_task
-    return LiberoEnv(
+    return LiberoEnvCompat(
         task=task,
         fps=args.env_fps,
         episode_length=args.env_episode_length,
         obs_type=args.env_obs_type,
         camera_name=args.env_camera_name,
-        task_ids=task_ids,
+        selected_task_ids=task_ids,
     )
 
 

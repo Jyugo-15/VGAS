@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import MethodType
 from typing import Any, Callable, Dict, Optional
@@ -87,9 +87,6 @@ def evaluate_policy_with_best_of_n(
         policy_cfg.device = device
         policy_cfg.n_action_steps = n_action_steps
         policy = make_policy(cfg=policy_cfg, env_cfg=env_cfg)
-        ########################
-        print(f"policy_cfg.n_action_steps:  {policy_cfg.n_action_steps}")
-        ########################
         policy.eval()
 
         preprocessor, postprocessor = make_pre_post_processors(
@@ -228,7 +225,7 @@ def _build_eval_critic(
     trainer.load_state_dict(ckpt.state_dict)
     # Evaluation only: reuse the online critic directly instead of the (stale) target copy
     if use_current_critic:
-        print("using current critic for eval")
+        # print("using current critic for eval")
         trainer.target_critic = trainer.critic
     trainer.critic.eval()
     trainer.target_critic.eval()
@@ -362,7 +359,7 @@ def _load_critic_checkpoint(path: Path) -> CriticCheckpoint:
         state_dict = payload
         cfg_dict = config_payload
         meta = {}
-    print("org config", cfg_dict)
+    # print("org config", cfg_dict)
     normalized_cfg = _normalize_critic_config(cfg_dict)
     cfg = CriticConfig(**normalized_cfg) if normalized_cfg is not None else CriticConfig()
     return CriticCheckpoint(state_dict=state_dict, config=cfg, meta=meta)
@@ -396,7 +393,7 @@ def build_policy_eval_bundle(
     use_current_critic: bool = False,
 ) -> PolicyEvalBundle:
     """Load policy/critic once and build reusable components for multiple tasks."""
-    print(policy_path)
+    # print(policy_path)
     policy_cfg = _load_policy_config(policy_path)
     policy_cfg.device = device
     policy_cfg.n_action_steps = n_action_steps
@@ -458,6 +455,14 @@ def _load_policy_config(policy_path: Path) -> SmolVLAConfig:
     with config_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     payload.pop("type", None)
+    valid_fields = {field.name for field in fields(SmolVLAConfig)}
+    unknown_fields = sorted(key for key in payload.keys() if key not in valid_fields)
+    if unknown_fields:
+        logging.warning(
+            "Dropping unsupported SmolVLA config fields for current lerobot version: %s",
+            ", ".join(unknown_fields),
+        )
+        payload = {key: value for key, value in payload.items() if key in valid_fields}
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as tmp:

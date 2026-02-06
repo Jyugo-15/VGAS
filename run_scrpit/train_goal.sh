@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 cd "${REPO_ROOT}"
 
-JOB_NAME="train_goal"
+JOB_NAME="train_goal_5s"
 LOG_DIR="${LOG_DIR:-logs/${JOB_NAME}}"
 if [[ "${1:-}" == "--nohup" ]]; then
   shift
@@ -19,9 +19,14 @@ fi
 
 export CUDA_VISIBLE_DEVICES=0
 export TOKENIZERS_PARALLELISM=false
-POLICY_PATH="${REPO_ROOT}/pretrained_vla/smolvla/5-shot/pretrained_model"
-DATASET_ROOT="${REPO_ROOT}/dataset/Libero/HF_LIBERO_5SHORT/libero_goal"
-EVAL_DATASET_ROOT="${REPO_ROOT}/dataset/Libero/HF_LIBERO_split/libero_goal"
+POLICY_TYPE="smolvla"
+BENCHMARK="libero"
+TASK_SUIT="libero_goal"
+SHOT_LABEL="5_SHOT"
+POLICY_PATH="${REPO_ROOT}/pretrained_vla/${POLICY_TYPE}/${SHOT_LABEL}/pretrained_model"
+OUTPUT_BASE="${REPO_ROOT}/outputs/train/${POLICY_TYPE}/${BENCHMARK}/${TASK_SUIT}/${SHOT_LABEL}"
+DATASET_ROOT="${REPO_ROOT}/dataset/Libero/HF_LIBERO_${SHOT_LABEL}/${TASK_SUIT}"
+EVAL_DATASET_ROOT="${REPO_ROOT}/dataset/Libero/HF_LIBERO_split/${TASK_SUIT}"
 CONDA_BASE="${CONDA_BASE:-${HOME}/Data/anaconda3}"
 if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
   source "${CONDA_BASE}/etc/profile.d/conda.sh"
@@ -32,6 +37,8 @@ fi
 conda activate ript_vla
 python scripts/run_qchunk_offline.py \
   --policy-path="${POLICY_PATH}" \
+  --output-dir="${OUTPUT_BASE}" \
+  --output-dir-layout=tag \
   --chunk-size=32 \
   --ood-m-actions=4 \
   --n-action-steps=20 \
@@ -41,7 +48,7 @@ python scripts/run_qchunk_offline.py \
   --critic-type=q_chunk_former \
   --steps=20000 \
   --log-interval=50 \
-  --batch-size=32 \
+  --batch-size=2 \
   --critic-only \
   --q-chunk-len=32 \
   --critic-lr=1e-4 \
@@ -76,5 +83,5 @@ python scripts/run_qchunk_offline.py \
   --eval-ranking-batch-size=32 \
   --checkpoint-interval 2000 \
   --eval-ranking-full-dataset-root="${EVAL_DATASET_ROOT}" \
-  --wandb \
-  --wandb-mode=online
+  # --wandb \
+  # --wandb-mode=online

@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-repo-id", type=str, default=DEFAULT_DATASET_REPO_ID, help="LeRobot dataset repo identifier.")
     parser.add_argument("--episodes", type=int, nargs="+", default=None, help="Optional subset of episode indices.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/train"), help="Base directory for outputs.")
+    parser.add_argument(
+        "--output-dir-layout",
+        type=str,
+        default="legacy",
+        choices=["legacy", "tag", "raw"],
+        help="Output directory layout: legacy=outputs/train/<date>/<job>, tag=outputs/train/.../tag/<job>, raw=use --output-dir as-is.",
+    )
     parser.add_argument("--job-name", type=str, default=DEFAULT_JOB_NAME, help="Custom run name (defaults to q_agg_* auto naming when omitted).")
     parser.add_argument("--resume", action="store_true", help="Resume training from an existing checkpoint.")
     parser.add_argument("--config-path", type=Path, default=None, help=f"Path to an existing `{TRAIN_CONFIG_NAME}` when using `--resume`.")
@@ -332,9 +339,17 @@ def build_critic_config(args: argparse.Namespace, q_chunk_len: int | None = None
 
 def build_train_config(args: argparse.Namespace) -> TrainWithCriticPipelineConfig:
     job_name = build_job_name(args)
-    job_name += "test"
-    date_prefix = datetime.now().strftime("%m.%d")
-    output_dir = args.output_dir / date_prefix / job_name
+    output_dir_layout = getattr(args, "output_dir_layout", "legacy")
+    if output_dir_layout == "legacy":
+        job_name += "test"
+        date_prefix = datetime.now().strftime("%m.%d")
+        output_dir = args.output_dir / date_prefix / job_name
+    elif output_dir_layout == "tag":
+        output_dir = args.output_dir / job_name
+    elif output_dir_layout == "raw":
+        output_dir = args.output_dir
+    else:
+        raise ValueError(f"Unknown output_dir_layout '{output_dir_layout}'.")
 
     n_action_steps = args.n_action_steps or args.chunk_size
     if n_action_steps > args.chunk_size:

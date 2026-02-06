@@ -1,6 +1,5 @@
 # Local data/artifacts
 /pretrained_vla/
-/output/
 /dataset/
 /.vscode/
 /outputs/
@@ -8,3 +7,16 @@
 *.pyc
 __pycache__/
 /logs/
+/paper.txt
+/compare
+/run_scrpit/*
+!/run_scrpit/test_bc.sh
+!/run_scrpit/test_vgas.sh
+!/run_scrpit/train_goal.sh
+/qchunk/best_of_n_critic_org.py
+/data/hflibero_dataset_pipeline.sh
+/data/README.md
+/data/push_to_hub.py
+/data/push_to_hub_preview.py
+/data/push_to_hub_visual.py
+/to-huggingface/

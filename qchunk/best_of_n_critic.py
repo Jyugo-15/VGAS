@@ -186,10 +186,10 @@ class BestOfNCriticTrainer:
                 return 1.0
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-        print("==================================crtic config==================================")
-        print(cfg)
-        print("==================================critic module==================================")
-        print(critic)
+        # print("==================================crtic config==================================")
+        # print(cfg)
+        # print("==================================critic module==================================")
+        # print(critic)
         trainer = cls(
             critic,
             target_critic,
