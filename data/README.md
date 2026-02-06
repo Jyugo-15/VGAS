@@ -8,7 +8,7 @@ merged dataset, annotates rewards, then splits into per-suit datasets.
 We provide the 5-shot dataset used in our experiments on Hugging Face:
 https://huggingface.co/datasets/SemyonXu616/HF_LIBERO_5_SHOT
 
-## `hflibero_fewshot_dataset_pipeline.sh` (核心流程)
+## `hflibero_fewshot_dataset_pipeline.sh`
 
 This script implements the **one-pass** workflow we want:
 

@@ -77,6 +77,8 @@ Our experiment results can be reproduced by running `run_scrpit/test_bc.sh` (BC)
 The fine-tuned 5-shot SmolVLA and trained critic checkpoints are available at:
 https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main
 
+The few-shot (5-shot) dataset can be generated with `data/hflibero_fewshot_dataset_pipeline.sh`; see `data/README.md` for details. We also released the dataset used in our experiments on Hugging Face: `https://huggingface.co/datasets/SemyonXu616/HF_LIBERO_5_SHOT`.
+
 ## TODO
 
 - Add additional benchmarks (e.g., MetaWorld).
