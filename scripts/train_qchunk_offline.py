@@ -940,6 +940,7 @@ def train(cfg: TrainWithCriticPipelineConfig):
     ranking_loader: Optional[DataLoader] = None
     ranking_full_loader: Optional[DataLoader] = None
     ranking_full_dataset = None
+    full_ranking_eval_disabled = False
     ######### offline step
     for _ in range(step, cfg.steps):
         # if _ % 10 == 0:
@@ -1089,41 +1090,53 @@ def train(cfg: TrainWithCriticPipelineConfig):
             metrics_to_log["rank_eval/train/time_s"] = rank_time
 
             full_root = getattr(cfg.critic, "eval_ranking_full_dataset_root", None)
-            if full_root:
-                if ranking_full_loader is None:
-                    tmp_cfg = copy.deepcopy(cfg)
-                    tmp_cfg.dataset = copy.deepcopy(cfg.dataset)
-                    tmp_cfg.dataset.root = str(full_root)
-                    tmp_cfg.dataset.include_future_observation = False
-                    try:
-                        ranking_full_dataset = _build_reward_augmented_dataset(tmp_cfg)
-                    except Exception as exc:
-                        logging.warning("Full-data ranking dataset build failed (%s); skipping full eval.", exc)
-                        ranking_full_dataset = None
-                    if ranking_full_dataset is not None:
-                        ranking_full_loader = _build_ranking_eval_loader(
-                            ranking_full_dataset,
-                            batch_size_eval,
-                            num_workers=cfg.num_workers,
-                            pin_memory=device.type == "cuda",
-                            prefetch_factor=2,
-                        )
-                if ranking_full_loader is not None:
-                    start_full = time.perf_counter()
-                    full_metrics = _evaluate_critic_ranking(
-                        policy,
-                        critic,
-                        ranking_full_loader,
-                        device,
-                        max_batches=max_batches_eval,
-                        action_samples=action_samples_eval,
-                        action_weights=action_weights,
-                        chunk_len=critic.q_chunk_len,
-                        preprocessor=preprocessor,
+            if full_root and not full_ranking_eval_disabled:
+                full_root_path = Path(str(full_root)).expanduser()
+                if not full_root_path.exists():
+                    logging.warning(
+                        "Full-data ranking root not found (%s); disabling full ranking eval.",
+                        full_root_path,
                     )
-                    rank_full_time = time.perf_counter() - start_full
-                    metrics_to_log.update({f"rank_eval/full/{k}": v for k, v in full_metrics.items()})
-                    metrics_to_log["rank_eval/full/time_s"] = rank_full_time
+                    full_ranking_eval_disabled = True
+                else:
+                    try:
+                        if ranking_full_loader is None:
+                            tmp_cfg = copy.deepcopy(cfg)
+                            tmp_cfg.dataset = copy.deepcopy(cfg.dataset)
+                            tmp_cfg.dataset.root = str(full_root_path)
+                            tmp_cfg.dataset.include_future_observation = False
+                            ranking_full_dataset = _build_reward_augmented_dataset(tmp_cfg)
+                            ranking_full_loader = _build_ranking_eval_loader(
+                                ranking_full_dataset,
+                                batch_size_eval,
+                                num_workers=cfg.num_workers,
+                                pin_memory=device.type == "cuda",
+                                prefetch_factor=2,
+                            )
+                        if ranking_full_loader is not None:
+                            start_full = time.perf_counter()
+                            full_metrics = _evaluate_critic_ranking(
+                                policy,
+                                critic,
+                                ranking_full_loader,
+                                device,
+                                max_batches=max_batches_eval,
+                                action_samples=action_samples_eval,
+                                action_weights=action_weights,
+                                chunk_len=critic.q_chunk_len,
+                                preprocessor=preprocessor,
+                            )
+                            rank_full_time = time.perf_counter() - start_full
+                            metrics_to_log.update({f"rank_eval/full/{k}": v for k, v in full_metrics.items()})
+                            metrics_to_log["rank_eval/full/time_s"] = rank_full_time
+                    except Exception as exc:
+                        logging.warning(
+                            "Full-data ranking eval failed (%s); disabling full ranking eval.",
+                            exc,
+                        )
+                        ranking_full_loader = None
+                        ranking_full_dataset = None
+                        full_ranking_eval_disabled = True
 
             if wandb_logger:
                 wandb_logger.log_dict(metrics_to_log, step)
