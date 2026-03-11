@@ -478,6 +478,11 @@ def _load_policy_config(policy_path: Path) -> SmolVLAConfig:
 
 
 def _augment_with_task(vec_env: Any, observation: dict[str, Any]) -> dict[str, Any]:
+    # MetaWorld policies may require both observation.state and
+    # observation.environment_state; mirror state when env_state is absent.
+    if "observation.state" in observation and "observation.environment_state" not in observation:
+        observation["observation.environment_state"] = observation["observation.state"]
+
     base_envs = getattr(vec_env, "envs", None)
     if base_envs and hasattr(base_envs[0], "task_description"):
         task_result = vec_env.call("task_description")

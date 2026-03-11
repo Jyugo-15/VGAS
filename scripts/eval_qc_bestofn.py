@@ -17,18 +17,33 @@ from huggingface_hub.constants import CONFIG_NAME
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-    PROJECT_ROOT = REPO_ROOT.parent
-    LEROBOT_SRC = PROJECT_ROOT / "lerobot" / "src"
-    if LEROBOT_SRC.exists() and str(LEROBOT_SRC) not in sys.path:
-        sys.path.insert(0, str(LEROBOT_SRC))
+PROJECT_ROOT = REPO_ROOT.parent
+LEROBOT_SRC = PROJECT_ROOT / "lerobot" / "src"
+# Keep local lerobot as a fallback path, but do not shadow installed package versions.
+if LEROBOT_SRC.exists() and str(LEROBOT_SRC) not in sys.path:
+    sys.path.append(str(LEROBOT_SRC))
 
 DEFAULT_POLICY_PATH = REPO_ROOT / "pretrained_vla/smolvla/5-shot/pretrained_model"
 DEFAULT_CRITIC_PATH = REPO_ROOT / "outputs/train/12.27/goal_vgas/checkpoints/018000/critic_pretrained_model/last.ckpt"
 
-from libero.libero import benchmark
+try:
+    from libero.libero import benchmark
+except ImportError:
+    benchmark = None  # type: ignore[assignment]
 from utils import init_logging
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.envs.configs import EnvConfig, LiberoEnv
+try:
+    from lerobot.envs.configs import MetaworldEnv
+except ImportError:
+    MetaworldEnv = None  # type: ignore[assignment]
+from lerobot.utils.constants import OBS_ENV_STATE
+
+try:
+    from lerobot.envs.metaworld import DIFFICULTY_TO_TASKS as METAWORLD_TASK_GROUPS
+except Exception:  # pragma: no cover - optional dependency/runtime
+    METAWORLD_TASK_GROUPS = {}
 
 from smolvla_qchunk.eval import (
     PolicyEvalBundle,
@@ -263,27 +278,68 @@ def main() -> None:
 
 def _build_env_config(
     args: argparse.Namespace, task_name: str | None = None, task_ids: tuple[int, ...] | None = None
-) -> LiberoEnv:
-    if args.env_type != "libero":
-        raise ValueError(f"Only 'libero' env_type is supported for now (got {args.env_type}).")
-    suite_task_ids = getattr(args, "suite_task_ids", {}) or {}
-    if task_ids is None:
-        suite_ids = None if task_name is None else suite_task_ids.get(task_name)
-        if suite_ids is not None:
-            task_ids = tuple(suite_ids)
-        elif getattr(args, "eval_all_suite_tasks", False):
-            task_ids = None
-        else:
-            task_ids = tuple(args.env_task_ids) if args.env_task_ids is not None else (0,)
+) -> EnvConfig:
     task = task_name if task_name is not None else args.env_task
-    return LiberoEnvCompat(
-        task=task,
-        fps=args.env_fps,
-        episode_length=args.env_episode_length,
-        obs_type=args.env_obs_type,
-        camera_name=args.env_camera_name,
-        selected_task_ids=task_ids,
-    )
+    if args.env_type == "libero":
+        suite_task_ids = getattr(args, "suite_task_ids", {}) or {}
+        if task_ids is None:
+            suite_ids = None if task_name is None else suite_task_ids.get(task_name)
+            if suite_ids is not None:
+                task_ids = tuple(suite_ids)
+            elif getattr(args, "eval_all_suite_tasks", False):
+                task_ids = None
+            else:
+                task_ids = tuple(args.env_task_ids) if args.env_task_ids is not None else (0,)
+        return LiberoEnvCompat(
+            task=task,
+            fps=args.env_fps,
+            episode_length=args.env_episode_length,
+            obs_type=args.env_obs_type,
+            camera_name=args.env_camera_name,
+            selected_task_ids=task_ids,
+        )
+
+    if args.env_type == "metaworld":
+        if MetaworldEnv is None:
+            raise ValueError(
+                "env_type=metaworld was requested, but MetaworldEnv is unavailable in the current lerobot install."
+            )
+        # Default behavior: keep task groups (easy/medium/hard/very_hard) intact.
+        # Only resolve to a concrete task when explicit task-ids are requested.
+        explicit_task_id_mode = args.env_task_ids is not None or getattr(args, "eval_all_suite_tasks", False)
+        if explicit_task_id_mode and task_ids is not None:
+            if len(task_ids) != 1:
+                raise ValueError(f"Expected exactly one metaworld task id, got {task_ids}.")
+            requested_id = task_ids[0]
+            tasks_in_group = METAWORLD_TASK_GROUPS.get(task)
+            if tasks_in_group is not None:
+                if requested_id < 0 or requested_id >= len(tasks_in_group):
+                    raise ValueError(
+                        f"Invalid MetaWorld task id {requested_id} for group '{task}'. "
+                        f"Valid range: [0, {len(tasks_in_group) - 1}]"
+                    )
+                task = tasks_in_group[requested_id]
+            elif requested_id != 0:
+                raise ValueError(
+                    f"Task '{task}' is not a known MetaWorld group; only task id 0 is valid for custom task names."
+                )
+        cfg = MetaworldEnv(
+            task=task,
+            fps=args.env_fps,
+            episode_length=args.env_episode_length,
+            obs_type=args.env_obs_type,
+        )
+        # Some MetaWorld policies expect both observation.state and observation.environment_state.
+        # The default MetaworldEnv exposes only agent_pos -> observation.state; add a compatible
+        # env-state feature declaration so policy/env feature checks can pass.
+        if "environment_state" not in cfg.features:
+            state_shape = cfg.features.get("agent_pos").shape if "agent_pos" in cfg.features else (4,)
+            cfg.features["environment_state"] = PolicyFeature(type=FeatureType.ENV, shape=state_shape)
+        if "environment_state" not in cfg.features_map:
+            cfg.features_map["environment_state"] = OBS_ENV_STATE
+        return cfg
+
+    raise ValueError(f"Unsupported env_type '{args.env_type}'. Expected one of: libero, metaworld.")
 
 
 def _log_eval_summary(info: dict) -> None:
@@ -320,10 +376,24 @@ def _read_n_action_steps(policy_path: Path) -> int | None:
 
 
 def _task_ids_to_eval(args: argparse.Namespace, task_name: str) -> list[int]:
+    if args.env_type == "metaworld":
+        if args.env_task_ids is not None:
+            return list(args.env_task_ids)
+        if getattr(args, "eval_all_suite_tasks", False):
+            tasks = METAWORLD_TASK_GROUPS.get(task_name)
+            if tasks is not None:
+                return list(range(len(tasks)))
+        # Default: evaluate this group/task once (the underlying env may already be multi-task).
+        return [0]
+
     suite_task_ids = getattr(args, "suite_task_ids", {}) or {}
     if task_name in suite_task_ids:
         return list(suite_task_ids[task_name])
     if getattr(args, "eval_all_suite_tasks", False):
+        if benchmark is None:
+            raise ValueError(
+                "env_type=libero requires the `libero` package when --eval-all-suite-tasks is enabled."
+            )
         bench = benchmark.get_benchmark_dict()
         if task_name not in bench:
             raise ValueError(f"Unknown LIBERO suite '{task_name}'. Available: {', '.join(sorted(bench.keys()))}")
