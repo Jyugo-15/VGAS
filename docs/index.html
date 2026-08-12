@@ -190,10 +190,7 @@
 
 <section id="method">
   <div class="wrap">
-    <h2>Framework</h2>
-    <div class="lead">
-      <p>We reformulate few-shot VLA adaptation as value-guided policy improvement. Instead of forcing a generative policy to jointly acquire semantic reasoning and fine-grained geometric control, we decouple adaptation into high-recall proposal generation and high-precision, outcome-aware selection — and then fold that value signal back into the policy.</p>
-    </div>
+    <h2>Overview</h2>
 
     <figure style="margin-top:22px">
       <img class="paperfig" src="assets/fig2_framework.png" alt="Framework overview: (a) shared Q-Chunk-Former critic trained with TD + EGR, (b) VGAS inference-time Best-of-N selection, (c) VGAS+ post-training policy extraction" />
@@ -239,13 +236,6 @@
       </table>
     </div>
     <p class="note" style="text-align:center; margin-top:14px">All values from the paper (mean over 6 evaluation seeds, 50 episodes per task per seed). With a 0.45B SmolVLA base, VGAS+ surpasses the 3.5B &pi;<sub>0</sub> on average on both benchmarks. Full comparisons and ablations in the paper.</p>
-
-    <h3 style="text-align:center; margin-top:34px">Cost of the value guidance</h3>
-    <div class="figrow">
-      <figure><img class="paperfig" src="assets/fig_pareto_latency.png" alt="Success rate versus per-decision-step latency" /></figure>
-      <figure><img class="paperfig" src="assets/fig_pareto_memory.png" alt="Success rate versus peak CUDA memory" /></figure>
-    </div>
-    <figcaption>Best-of-<em>N</em> selection buys accuracy with inference cost, and saturates around <em>N</em>=8. VGAS+ moves the value signal into training instead: it reaches the highest success rate at <strong>single-sample inference cost</strong> — no critic, no reranking at deployment.</figcaption>
 
     <h3 style="text-align:center; margin-top:34px">Rollout comparisons</h3>
     <p class="note" style="text-align:center; max-width:730px; margin:0 auto 30px; color:var(--muted); font-size:14.5px">
@@ -355,19 +345,20 @@
   <div class="wrap">
     <h2>Why it works</h2>
 
-    <h3 style="text-align:center">EGR keeps the value landscape discriminative</h3>
-    <figure>
-      <img class="paperfig" src="assets/fig_valuemap.png" alt="Value landscape over candidate action chunks under CQL versus EGR at several execution steps" />
-      <figcaption>Value landscape over candidate chunks at four execution steps (white dots: proposals; red: ground truth). Uniformly conservative CQL flattens the region the proposals actually occupy, so near-miss candidates become indistinguishable. <strong>EGR</strong> instead shapes a value funnel toward the demonstration, preserving the ranking resolution that Best-of-<em>N</em> depends on.</figcaption>
-    </figure>
-
-    <h3 style="text-align:center; margin-top:34px">Selection concentrates the policy; extraction internalizes it</h3>
+    <h3 style="text-align:center">Selection concentrates the policy; extraction internalizes it</h3>
     <div class="figrow3">
       <figure><img class="paperfig" src="assets/fig3a_dist.png" alt="Action distribution, projection 1" /></figure>
       <figure><img class="paperfig" src="assets/fig3b_dist.png" alt="Action distribution, projection 2" /></figure>
       <figure><img class="paperfig" src="assets/fig3c_dist.png" alt="Action distribution, projection 3" /></figure>
     </div>
     <figcaption>Candidate chunks in three projected action subspaces. The SFT policy's proposals (blue) sprawl around the demonstrations (red). Critic-selected chunks (orange) concentrate toward them — this is VGAS at inference time. After policy extraction, the refined policy samples (purple) land there <em>directly</em>, which is why VGAS+ needs no reranking at deployment.</figcaption>
+
+    <h3 style="text-align:center; margin-top:34px">Cost of the value guidance</h3>
+    <div class="figrow">
+      <figure><img class="paperfig" src="assets/fig_pareto_latency.png" alt="Success rate versus per-decision-step latency" /></figure>
+      <figure><img class="paperfig" src="assets/fig_pareto_memory.png" alt="Success rate versus peak CUDA memory" /></figure>
+    </div>
+    <figcaption>Best-of-<em>N</em> selection buys accuracy with inference cost, and saturates around <em>N</em>=8. VGAS+ moves the value signal into training instead: it reaches the highest success rate at <strong>single-sample inference cost</strong> — no critic, no reranking at deployment.</figcaption>
   </div>
 </section>
 
