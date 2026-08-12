@@ -1,12 +1,7 @@
-"""Local SmolVLA implementation mirroring LeRobot without external dependency on the policy wrapper."""
+"""Local SmolVLA modules.
 
-from .configuration import SmolVLAConfig
-from .processor import make_smolvla_pre_post_processors, SmolVLANewLineProcessor
-from .modeling import SmolVLAPolicy
+Keep package import side effects minimal. Import submodules directly, e.g.
+`models.smolvla.modeling_smolvla`.
+"""
 
-__all__ = [
-    "SmolVLAConfig",
-    "SmolVLAPolicy",
-    "make_smolvla_pre_post_processors",
-    "SmolVLANewLineProcessor",
-]
+__all__: list[str] = []

@@ -6,7 +6,6 @@ import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
-import time
 import sys
 
 import torch
@@ -19,8 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from models.smolvla.modeling import make_att_2d_masks
-import numpy as np
+from models.smolvla.modeling_smolvla import make_att_2d_masks
 
 
 def _build_attention_mask(bool_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -101,7 +99,7 @@ class Q_Former_Backbone(nn.Module):
         output = hidden_states
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            output = layer(
+            layer_out = layer(
                 output,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -111,6 +109,8 @@ class Q_Former_Backbone(nn.Module):
                 output_attentions=False,
                 use_cache=False,
             )
+            # Compatibility: some transformers versions return tuple(hidden_states, ...).
+            output = layer_out[0] if isinstance(layer_out, tuple) else layer_out
         return self.norm(output)
 
 
@@ -148,6 +148,64 @@ class ActionTokenizer(nn.Module):
         if actions.ndim != 3:
             raise ValueError("Expected (batch, chunk, action_dim) action tensor.")
         return self.proj(actions)
+
+
+class CriticVisionEncoder(nn.Module):
+    """Independent critic-side vision encoder copied from the actor VLM."""
+
+    def __init__(self, vlm_model: nn.Module, freeze_bottom_layers: int = 0):
+        super().__init__()
+        vision_model = getattr(vlm_model, "vision_model", None)
+        if vision_model is None:
+            raise ValueError("vlm_model.vision_model is required to build CriticVisionEncoder.")
+        self.vision_model = copy.deepcopy(vision_model)
+        connector = getattr(vlm_model, "connector", None)
+        self.connector = copy.deepcopy(connector) if connector is not None else None
+        for param in self.vision_model.parameters():
+            param.requires_grad = True
+        if self.connector is not None:
+            for param in self.connector.parameters():
+                param.requires_grad = True
+
+        freeze_bottom_layers = max(0, int(freeze_bottom_layers))
+        if freeze_bottom_layers > 0:
+            layer_modules = None
+            # Common layouts:
+            # - SiglipVisionModel: vision_model.encoder.layers
+            # - SiglipVisionTransformer: encoder.layers
+            vm_inner = getattr(self.vision_model, "vision_model", None)
+            if vm_inner is not None and hasattr(vm_inner, "encoder") and hasattr(vm_inner.encoder, "layers"):
+                layer_modules = vm_inner.encoder.layers
+            elif hasattr(self.vision_model, "encoder") and hasattr(self.vision_model.encoder, "layers"):
+                layer_modules = self.vision_model.encoder.layers
+            if layer_modules is not None:
+                freeze_count = min(freeze_bottom_layers, len(layer_modules))
+                for layer_idx in range(freeze_count):
+                    for param in layer_modules[layer_idx].parameters():
+                        param.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        target_dtype = next(self.vision_model.parameters()).dtype
+        hidden = self.vision_model(
+            pixel_values=images.to(dtype=target_dtype),
+            patch_attention_mask=None,
+        ).last_hidden_state
+        if self.connector is not None:
+            hidden = self.connector(hidden)
+        return hidden
+
+
+class CriticLanguageEmbedding(nn.Module):
+    """Frozen token embedding table for critic-side language tokens."""
+
+    def __init__(self, embed_tokens: nn.Module):
+        super().__init__()
+        self.embed_tokens = copy.deepcopy(embed_tokens)
+        for param in self.embed_tokens.parameters():
+            param.requires_grad = False
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(token_ids)
 
 
 class TransformerCriticHead(nn.Module):
@@ -236,7 +294,7 @@ class TransformerCriticHead(nn.Module):
         value_tokens = self.value_token.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 1, -1)
         token_segments.append(value_tokens)
         pad_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device))
-        att_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device)) # 可改
+        att_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device))  # adjustable
 
         tokens = torch.cat(token_segments, dim=1).to(dtype)
         pad_mask = torch.cat(pad_segments, dim=1)
@@ -296,7 +354,7 @@ class ValueQueryHead(nn.Module):
     ) -> torch.Tensor:
         """Return query embeddings built from prefix representations."""
 
-        augmented_embs, aug_pad_masks, aug_att_masks = self._append_query_token_my(prefix_embs, pad_masks, att_masks) ##直接插入
+        augmented_embs, aug_pad_masks, aug_att_masks = self._append_query_token_my(prefix_embs, pad_masks, att_masks)  # inserted directly
         att_2d_masks = make_att_2d_masks(aug_pad_masks, aug_att_masks)
         
         attention_mask = _build_attention_mask(att_2d_masks, dtype=augmented_embs.dtype)
@@ -422,6 +480,7 @@ class ValueHeadConfig:
     vlm_model_name: str | None = None
     att_mode: str = "causal"
     use_raw_state_fusion: bool = False
+    fuse_vlm_state: bool = True
     raw_state_dim: int = 8
     bias_init_enabled: bool = False
     bias_init_value: float = 0.0
@@ -452,17 +511,12 @@ class Qchunk_Former(nn.Module):
         )
         # Raw state fusion (optional, backward compatible)
         self.use_raw_state_fusion = getattr(config, "use_raw_state_fusion", False)
+        self.fuse_vlm_state = bool(getattr(config, "fuse_vlm_state", True))
         self.raw_state_dim = getattr(config, "raw_state_dim", 8)
         self.hidden_size = text_config.hidden_size if text_config is not None else None
         if self.hidden_size is None and self.use_raw_state_fusion:
             raise ValueError("Cannot enable raw_state_fusion without a known hidden size.")
         if self.use_raw_state_fusion:
-            # VLM State: 960 -> 512 (高带宽保持语义)
-            self.vlm_proj = nn.Sequential(
-                nn.Linear(self.hidden_size, 512),
-                nn.LayerNorm(512),
-                nn.GELU(),
-            )
             # Action: 7 -> 256
             self.act_proj = nn.Linear(config.action_dim, 256)
             # Raw State: raw_state_dim -> 192
@@ -472,8 +526,19 @@ class Qchunk_Former(nn.Module):
                 nn.Linear(128, 192),
                 nn.LayerNorm(192),
             )
+            if self.fuse_vlm_state:
+                # VLM state: hidden -> 512 (wide enough to preserve semantics)
+                self.vlm_proj = nn.Sequential(
+                    nn.Linear(self.hidden_size, 512),
+                    nn.LayerNorm(512),
+                    nn.GELU(),
+                )
+                fusion_in_dim = 512 + 192 + 256
+            else:
+                self.vlm_proj = None
+                fusion_in_dim = 192 + 256
             self.fusion = nn.Sequential(
-                nn.Linear(512 + 192 + 256, self.hidden_size),  # 512(VLM) + 192(Raw) + 256(Action) = 960
+                nn.Linear(fusion_in_dim, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
                 nn.Dropout(0.1),
             )
@@ -498,28 +563,33 @@ class Qchunk_Former(nn.Module):
                 raw_state = raw_state[:, 0]
             raw_state = raw_state.to(device=device, dtype=actions.dtype)
             act_emb = self.act_proj(actions)
-            # pick last valid prefix token based on masks (True=valid, handles internal padding)
-            seq_len = prefix_embs.shape[1]
-            if pad_masks is not None:
-                positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(prefix_embs.shape[0], -1)
-                masked_pos = positions.masked_fill(~pad_masks.bool(), -1)
-                last_idx = masked_pos.max(dim=1).values
-            elif att_masks is not None:
-                positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(prefix_embs.shape[0], -1)
-                masked_pos = positions.masked_fill(~att_masks.bool(), -1)
-                last_idx = masked_pos.max(dim=1).values
-            else:
-                last_idx = torch.full((prefix_embs.shape[0],), seq_len - 1, device=device, dtype=torch.long)
-            last_idx = last_idx.clamp(min=0, max=seq_len - 1)
-            batch_idx = torch.arange(prefix_embs.shape[0], device=device)
-            vlm_state = prefix_embs[batch_idx, last_idx]
-            vlm_emb = self.vlm_proj(vlm_state)
             raw_emb = self.raw_proj(raw_state)
-
-            vlm_rep = vlm_emb.unsqueeze(1).expand(-1, chunk_len, -1)
             raw_rep = raw_emb.unsqueeze(1).expand(-1, chunk_len, -1)
-            fused = torch.cat([vlm_rep, raw_rep, act_emb], dim=-1)
-            fused = self.fusion(fused).to(prefix_embs.dtype)
+            if self.fuse_vlm_state:
+                if prefix_embs is None:
+                    raise ValueError("prefix_embs is required when fuse_vlm_state=True.")
+                # Pick last valid prefix token based on masks (True=valid, handles internal padding).
+                seq_len = prefix_embs.shape[1]
+                if pad_masks is not None:
+                    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(prefix_embs.shape[0], -1)
+                    masked_pos = positions.masked_fill(~pad_masks.bool(), -1)
+                    last_idx = masked_pos.max(dim=1).values
+                elif att_masks is not None:
+                    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(prefix_embs.shape[0], -1)
+                    masked_pos = positions.masked_fill(~att_masks.bool(), -1)
+                    last_idx = masked_pos.max(dim=1).values
+                else:
+                    last_idx = torch.full((prefix_embs.shape[0],), seq_len - 1, device=device, dtype=torch.long)
+                last_idx = last_idx.clamp(min=0, max=seq_len - 1)
+                batch_idx = torch.arange(prefix_embs.shape[0], device=device)
+                vlm_state = prefix_embs[batch_idx, last_idx]
+                vlm_emb = self.vlm_proj(vlm_state)
+                vlm_rep = vlm_emb.unsqueeze(1).expand(-1, chunk_len, -1)
+                fused = torch.cat([vlm_rep, raw_rep, act_emb], dim=-1)
+            else:
+                fused = torch.cat([raw_rep, act_emb], dim=-1)
+            target_dtype = prefix_embs.dtype if prefix_embs is not None else actions.dtype
+            fused = self.fusion(fused).to(target_dtype)
             if actions_is_pad is None:
                 actions_is_pad = torch.zeros(batch_size, chunk_len, dtype=torch.bool, device=device)
             return self.head(
@@ -631,13 +701,17 @@ class Q_Former(nn.Module):
       
         pad_segments.append(~actions_is_pad.bool()) # for action token
         pad_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device)) # for value token
-        # 需要得到 query 的位置 ，value的位置
+        # Locate the query token and the value token.
 
         att_segments.append(att_masks)
         if self.att_mode == "causal":
             att_segments.append(torch.ones(batch_size, action_tokens.shape[1], dtype=torch.bool, device=device))
         # att_segments.append(~actions_is_pad.bool())
         else:
+            # bi-level: 4-level hierarchy via cumsum trick.
+            # state=True → cumsum=1; action_0=True → cumsum=2; action_1..N=False → cumsum stays 2.
+            # Result: state (cumsum=1) CANNOT attend actions (cumsum=2),
+            # but all action tokens share cumsum=2 → bidirectional with each other and can attend state.
             att_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device))
             att_segments.append(torch.zeros(batch_size, action_tokens.shape[1]-1, dtype=torch.bool, device=device))
         att_segments.append(torch.ones(batch_size, 1, dtype=torch.bool, device=device)) # for value token
@@ -650,7 +724,7 @@ class Q_Former(nn.Module):
 
 
         attention_mask = _build_attention_mask(att_2d_masks, dtype=tokens.dtype)
-        # attention_mask打印
+        # attention_mask debug print
         position_ids = torch.cumsum(pad_mask.long(), dim=1) - 1
         position_ids = position_ids.clamp_min(0)
 

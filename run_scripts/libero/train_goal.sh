@@ -1,0 +1,82 @@
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+cd "${REPO_ROOT}"
+
+JOB_NAME="train_goal_5s"
+LOG_DIR="${LOG_DIR:-logs/${JOB_NAME}}"
+if [[ "${1:-}" == "--nohup" ]]; then
+  shift
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="${LOG_DIR}/${JOB_NAME}_$(date +%F_%H-%M-%S).log"
+  LOG_FILE_ABS="$(readlink -f "$LOG_FILE")"
+  nohup bash "$0" "$@" >"$LOG_FILE_ABS" 2>&1 &
+  echo "started in background: pid=$! log= $LOG_FILE_ABS"
+  exit 0
+fi
+
+export CUDA_VISIBLE_DEVICES=0
+export TOKENIZERS_PARALLELISM=false
+POLICY_TYPE="smolvla"
+BENCHMARK="libero"
+TASK_SUIT="libero_goal"
+SHOT_LABEL="5_SHOT"
+POLICY_PATH="${REPO_ROOT}/pretrained_vla/${POLICY_TYPE}/${SHOT_LABEL}/pretrained_model"
+OUTPUT_BASE="${REPO_ROOT}/outputs/train/${POLICY_TYPE}/${BENCHMARK}/${TASK_SUIT}/${SHOT_LABEL}"
+DATASET_ROOT="${REPO_ROOT}/dataset/Libero/HF_LIBERO_${SHOT_LABEL}/${TASK_SUIT}"
+CONDA_BASE="${CONDA_BASE:-${HOME}/Data/anaconda3}"
+if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+  source "${CONDA_BASE}/etc/profile.d/conda.sh"
+else
+  echo "conda.sh not found at ${CONDA_BASE}/etc/profile.d/conda.sh" >&2
+  exit 1
+fi
+conda activate VGAS
+python scripts/run_qchunk_offline.py \
+  --policy-path="${POLICY_PATH}" \
+  --output-dir="${OUTPUT_BASE}" \
+  --output-dir-layout=tag \
+  --chunk-size=32 \
+  --ood-m-actions=4 \
+  --n-action-steps=20 \
+  --dataset-repo-id=libero_goal \
+  --dataset-root="${DATASET_ROOT}" \
+  --job-name="${JOB_NAME}" \
+  --critic-type=q_chunk_former \
+  --steps=20000 \
+  --log-interval=50 \
+  --batch-size=2 \
+  --q-chunk-len=32 \
+  --critic-lr=1e-4 \
+  --critic-lr-final=2.5e-5 \
+  --critic-total-steps=20000 \
+  --critic-q-agg=min \
+  --critic-loss-mode=per_head_mean \
+  --critic-att-mode=bi-level \
+  --critic-use-state-encoder=false \
+  --critic-use-independent-encoder=false \
+  --use-calql=false \
+  --use-ood-reg=true \
+  --dist-penalty-beta=5.0 \
+  --dist-clamp-max=10.0 \
+  --use-raw-state-fusion=true \
+  --critic-grad-clip=10 \
+  --critic-action-weights 5 5 5 1 1 1 1 \
+  --discount=0.98 \
+  --critic-mask-dropout-prob=0.0 \
+  --ood-alpha=5.0 \
+  --ood-action-source=erg \
+  --use-ood-noise=true \
+  --use-ood-trunc=false \
+  --use-ood-mix=true \
+  --debug-mix-dist=false \
+  --ood-noise-stds 0.02 \
+  --ood-mix-ratio=1.0 \
+  --ood-mix-alpha-low=0.2 \
+  --ood-mix-alpha-high=0.8 \
+  --loss-rank-weight=5.0 \
+  --checkpoint-interval 2000 \
+  # --wandb \
+  # --wandb-mode=online

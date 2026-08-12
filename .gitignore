@@ -1,22 +1,33 @@
-# Local data/artifacts
+# ==== Local data / artifacts (not published) ====
 /pretrained_vla/
 /dataset/
-/.vscode/
 /outputs/
+/output_metaworld/
+/output_metaworld_new/
+/logs/
 /test_log/
+/to-huggingface/
+/tmp_eval_smoke/
+/diagnostics/
+/diagnostics_mask_gt/
+/diagnose_vgas/
+/analysis/
+/compare
+/paper/
+/paper.txt
+/temp/
+/research/
+nohup.out
+*.log
+
+# ==== Python ====
 *.pyc
 __pycache__/
-/logs/
-/paper.txt
-/compare
-/run_scrpit/*
-!/run_scrpit/test_bc.sh
-!/run_scrpit/test_vgas.sh
-!/run_scrpit/train_goal.sh
-/qchunk/best_of_n_critic_org.py
-/data/hflibero_dataset_pipeline.sh
-/data/README.md
-/data/push_to_hub.py
-/data/push_to_hub_preview.py
-/data/push_to_hub_visual.py
-/to-huggingface/
+
+# ==== Editor / env / assistant context ====
+/.vscode/
+.env
+CLAUDE.md
+
+# local video/material staging for the project page (not part of the release)
+/project_page_assets/

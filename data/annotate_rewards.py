@@ -1,8 +1,7 @@
-#新增mc return字段
 """Add per-episode reward labels to a split HFLibero dataset.
 
 The script assumes the dataset already follows the LeRobot v3.0 layout produced by
-``data/split_hflibero_by_suite.py``. It appends a ``reward`` column to every frame,
+``data/libero/split_hflibero_by_suite.py``. It appends a ``reward`` column to every frame,
 marking the final ``n_last`` timesteps of each episode with ``reward_value`` and setting
 all preceding frames to ``default_reward`` (zero by default).
 

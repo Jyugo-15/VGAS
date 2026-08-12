@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -477,6 +477,7 @@ def compute_weighted_distance(
     actions: torch.Tensor,
     ood_actions: torch.Tensor,
     pad_mask: torch.Tensor | None = None,
+    weights_override: Any | None = None,
 ) -> torch.Tensor:
     pred_actions = ood_actions
     gt_actions = actions
@@ -484,7 +485,9 @@ def compute_weighted_distance(
         gt_actions = gt_actions.unsqueeze(1)
 
     diff = (pred_actions - gt_actions) ** 2
-    weights_list = getattr(trainer.cfg, "action_distance_weights", None)
+    weights_list = weights_override
+    if weights_list is None:
+        weights_list = getattr(trainer.cfg, "action_distance_weights", None)
     if weights_list is None:
         weights_list = getattr(trainer, "action_distance_weights", None)
     if weights_list is None:
@@ -550,6 +553,14 @@ def compute_explicit_penalty_loss(
         q_ood_values = (q_ood_values,)
 
     dist = compute_weighted_distance(trainer, actions, ood_actions, pad_mask=calc_dist_mask)
+    unit_weights = torch.ones(trainer.action_step_dim, device=ood_actions.device, dtype=ood_actions.dtype)
+    dist_equal_weight = compute_weighted_distance(
+        trainer,
+        actions,
+        ood_actions,
+        pad_mask=calc_dist_mask,
+        weights_override=unit_weights,
+    )
     beta = getattr(trainer.cfg, "dist_penalty_beta", 0.5)
     dist_clamp_max = getattr(trainer.cfg, "dist_clamp_max", 5.0)
     if dist_clamp_max is not None:
@@ -592,6 +603,7 @@ def compute_explicit_penalty_loss(
     with torch.no_grad():
         q_ood_det = q_ood.detach()
         dist_det = dist.detach()
+        dist_equal_det = dist_equal_weight.detach()
         idx_pol = m_policy
         idx_noise_start = idx_pol
         idx_noise_end = idx_noise_start + m_noise
@@ -616,6 +628,7 @@ def compute_explicit_penalty_loss(
             else 0.0
         )
         dist_policy_mean = dist_det[:, :idx_pol].mean().item() if idx_pol > 0 else 0.0
+        dist_policy_equal_mean = dist_equal_det[:, :idx_pol].mean().item() if idx_pol > 0 else 0.0
         dist_prec_mean = (
             dist_det[:, idx_noise_start:idx_noise_end].mean().item()
             if idx_noise_end > idx_noise_start
@@ -623,6 +636,11 @@ def compute_explicit_penalty_loss(
         )
         dist_mix_mean = (
             dist_det[:, idx_mix_start:idx_mix_end].mean().item()
+            if idx_mix_end > idx_mix_start
+            else 0.0
+        )
+        dist_mix_equal_mean = (
+            dist_equal_det[:, idx_mix_start:idx_mix_end].mean().item()
             if idx_mix_end > idx_mix_start
             else 0.0
         )
@@ -665,6 +683,8 @@ def compute_explicit_penalty_loss(
         "dist/prec": dist_prec_mean,
         "dist/mix": dist_mix_mean,
         "dist/trunc": dist_trunc_mean,
+        "dist/policy_w1111": dist_policy_equal_mean,
+        "dist/mix_w1111": dist_mix_equal_mean,
     }
     if loss_rank is not None:
         metrics["ood_loss_pairwise_raw"] = float(loss_rank.item())

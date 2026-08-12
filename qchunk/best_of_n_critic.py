@@ -246,6 +246,7 @@ class BestOfNCriticTrainer:
         batch: Dict[str, torch.Tensor],
         current_step: int | None = None,
         ood_warmup_steps: int = 0,
+        step_scheduler: bool = True,
     ) -> Dict[str, float]:
         
         self.critic.train()
@@ -264,10 +265,10 @@ class BestOfNCriticTrainer:
         critic_input_actions = actions.clone()
         # pad_indices = action_mask
         # if pad_indices.any():
-        #     # scale 建议 0.1 (归一化空间)
+        #     # scale of 0.1 works well in the normalised action space
         #     noise = torch.randn_like(critic_input_actions) * 0.1
         #     mask_broadcast = pad_indices.unsqueeze(-1)
-        #     # 仅填充前6维，pad 位置用噪声，valid 保持原值
+        #     # only the first 6 dims: noise at padded steps, valid steps untouched
         #     critic_input_actions[..., :6] = torch.where(
         #         mask_broadcast,
         #         noise[..., :6],
@@ -275,19 +276,19 @@ class BestOfNCriticTrainer:
         #     )
         critic_input_mask = action_mask.clone()
         if self.critic.training:
-            # 获取概率，默认 0.5
+            # dropout probability, 0.5 by default
             dropout_prob = getattr(self.cfg, "mask_dropout_prob", 0.5)
             
-            # 生成保留掩码: True=保持原样, False=强制变为Valid
-            # rand_like 生成 [0, 1]，大于 0.5 的部分保持原样
+            # keep_mask: True = leave the entry alone, False = force it to Valid
+            # rand_like draws from [0, 1]; entries above the threshold are kept
             keep_mask = torch.rand_like(critic_input_mask.float()) > dropout_prob
             
-            # 逻辑与操作:
-            # Valid(F) & Keep(T/F) -> Valid(F) (有效动作永远有效)
-            # Pad(T)   & Keep(T)   -> Pad(T)   (保持 Mask)
-            # Pad(T)   & Keep(F)   -> Valid(F) (Mask 消失了！Critic 被迫看动作值)
+            # Logical AND:
+            #   Valid(F) & Keep(T/F) -> Valid(F)  a real action always stays valid
+            #   Pad(T)   & Keep(T)   -> Pad(T)    the mask survives
+            #   Pad(T)   & Keep(F)   -> Valid(F)  mask dropped, so the critic must read the action values
             critic_input_mask = critic_input_mask & keep_mask
-        # 给 来自数据集的动作加一点点噪声
+        # Add a small amount of noise to the dataset actions.
 
         rewards = get_tensor_from_batch(batch, ["rewards"], default_shape=actions.shape[:2], device=self.device)
 
@@ -319,7 +320,7 @@ class BestOfNCriticTrainer:
         if valid_lens.ndim > 1:
             valid_lens = valid_lens.squeeze(-1)
         valid_lens = torch.clamp(valid_lens, min=0, max=self.chunk_size)
-        # pad 样本的有效长度置 0，避免后续 mask 出现随机值
+        # Zero the valid length of padded samples so later masks never contain garbage.
         pad_flat = next_pad.view(valid_lens.shape[0], -1).any(dim=1)
         valid_lens = valid_lens * (~pad_flat).long()
         range_tensor = torch.arange(self.chunk_size, device=self.device).unsqueeze(0).expand(valid_lens.shape[0], -1)
@@ -346,9 +347,9 @@ class BestOfNCriticTrainer:
         action_mask = action_mask.to(self.device).bool()
 
 
-        q_values = self.critic(encoding, critic_input_actions, action_mask=critic_input_mask, raw_state=raw_state)# 对原本 看不见的动作（超出episode 范围的）加了点噪声 
+        q_values = self.critic(encoding, critic_input_actions, action_mask=critic_input_mask, raw_state=raw_state)  # actions past the episode end carry a little noise
 
-        # 显式初始化，避免未定义问题
+        # Initialise explicitly so the name is always defined.
         calql_loss, calql_metrics = 0.0, {}
         ood_loss, ood_metrics = 0.0, {}
         q_ood_tensor = None
@@ -370,7 +371,7 @@ class BestOfNCriticTrainer:
 
         if use_ood_reg:
             if ood_payload is None:
-                raise ValueError("use_ood_reg=True 但未生成 ood_payload。")
+                raise ValueError("use_ood_reg=True but no ood_payload was produced.")
             ood_loss, ood_metrics, q_ood_tensor = compute_explicit_penalty_loss(
                 self, encoding, targets, actions, ood_payload
             )
@@ -378,7 +379,8 @@ class BestOfNCriticTrainer:
         if use_calql and ood_payload is not None:
             calql_loss, calql_metrics = compute_calql_loss(self, encoding, q_values, ood_payload)
 
-        # 控制损失如何在多个 head 之间聚合：默认先聚合 Q 再算 MSE，per-head 方式则每个 head 单独算再平均
+        # How the loss is aggregated over heads: by default aggregate Q first and then take the MSE;
+        # in per-head mode each head is scored separately and the results are averaged.
         loss_mode = getattr(self.cfg, "critic_loss_mode", "mse")
         losses = None
         if str(loss_mode).lower() in ("mse", "mean"):
@@ -391,7 +393,7 @@ class BestOfNCriticTrainer:
         else:
             raise ValueError(f"Unknown critic_loss_mode '{loss_mode}'.")
 
-        # 叠加正则项
+        # Add the regularisation terms.
         total_loss = td_loss
         if use_calql:
             alpha = getattr(self.cfg, "cql_alpha", 1.0)
@@ -409,7 +411,7 @@ class BestOfNCriticTrainer:
             grad_clip = grad_clip_warmup
         grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), grad_clip)
         self.optimizer.step()
-        if self.scheduler is not None:
+        if step_scheduler and self.scheduler is not None:
             self.scheduler.step()
         soft_update_target(self.target_critic, self.critic, tau_to_use)
         update_time = time.perf_counter() - start
@@ -456,7 +458,7 @@ class BestOfNCriticTrainer:
                     "gap/win_rate": float((gaps_mean > 0).float().mean().item()),
                 }
             metrics.update(gap_metrics)
-        # 动作幅度监控：policy 候选 vs 清洗后的 GT
+        # Monitor action magnitude: policy candidates vs. the cleaned ground truth.
         if next_action_candidates is not None:
             with torch.no_grad():
                 act_norm_policy = torch.norm(next_action_candidates[..., :6], dim=-1).mean()
@@ -557,7 +559,7 @@ class BestOfNCriticTrainer:
             self._shape_debug_done = True
 
         repeated_encoding = encoding.repeat(action_samples) # b1,b2 => b1,b1,b2,b2
-        zero_mask = torch.zeros(flat_actions.shape[:2], dtype=torch.bool, device=self.device) # zero mask代表全是有效的 action
+        zero_mask = torch.zeros(flat_actions.shape[:2], dtype=torch.bool, device=self.device)  # an all-zero mask means every action is valid
         eval_mask = zero_mask
         if forced_next_mask is not None:
             forced = forced_next_mask.to(self.device).bool()
@@ -572,7 +574,7 @@ class BestOfNCriticTrainer:
         raw_state_rep = raw_state.repeat_interleave(action_samples, dim=0)
         q_values = self.target_critic(repeated_encoding, flat_actions, action_mask=eval_mask, raw_state=raw_state_rep) # (h1=> [b1_c1,b1_c2],[b2,c1],[b2,c2]) (h2=> [b1_c1,b1_c2],[b2,c1],[b2,b2])
         self._last_target_head_means = [q.mean().item() for q in q_values] 
-        q = aggregate_q(q_values, getattr(self.cfg, "q_aggregation", "mean")) # 将不同q_network的q合在一起
+        q = aggregate_q(q_values, getattr(self.cfg, "q_aggregation", "mean"))  # combine the Q values across critic heads
         q = q.view(batch_size, action_samples, -1)
         best_indices = torch.argmax(q, dim=1).squeeze(-1)
         batch_indices = torch.arange(batch_size, device=self.device)

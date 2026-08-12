@@ -9,7 +9,6 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from pprint import pformat
 from typing import Any
 
 from huggingface_hub.constants import CONFIG_NAME
@@ -159,7 +158,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--task-dispatch",
+        choices=["sequential", "group"],
+        default="sequential",
+        help=(
+            "sequential (default): create one env per subtask, iterate explicitly "
+            "(LIBERO-compatible, current behavior). "
+            "group: pass the task-group name directly to the env and let it handle "
+            "all subtasks internally — matches lerobot-eval's --env.task=<group> "
+            "path used for BC baselines (MetaWorld fairness)."
+        ),
+    )
     parser.add_argument("--n-action-steps", type=int, default=20)
+    parser.add_argument(
+        "--policy-num-steps",
+        type=int,
+        default=None,
+        help="Optional override for SmolVLA flow-matching denoising steps (config.num_steps).",
+    )
     args = parser.parse_args()
     try:
         args.suite_task_ids = _parse_suite_task_ids(args.suite_task_ids)
@@ -179,6 +196,7 @@ def main() -> None:
     n_action_steps = args.n_action_steps
     if n_action_steps is None:
         logging.warning("Could not read policy n_action_steps from %s", args.policy_path)
+    policy_num_steps = args.policy_num_steps
 
     env_tasks = args.env_tasks if args.env_tasks is not None else [args.env_task]
     multi_task = len(env_tasks) > 1
@@ -186,15 +204,21 @@ def main() -> None:
         use_best_of_n=args.use_best_of_n,
         best_of_n=best_of_n,
         n_action_steps=n_action_steps,
+        policy_num_steps=policy_num_steps,
     )
     all_infos: dict[str, dict] = {}
 
     # Build policy/critic once to reuse across tasks.
-    sample_task_ids = _task_ids_to_eval(args, env_tasks[0])
-    if not sample_task_ids:
-        raise ValueError(f"No task ids resolved for suite '{env_tasks[0]}'.")
-    sample_task_id = sample_task_ids[0]
-    sample_env_cfg = _build_env_config(args, task_name=env_tasks[0], task_ids=(sample_task_id,))
+    # group dispatch: use task_ids=None so the env cfg mirrors the BC lerobot-eval path.
+    # sequential dispatch: use the first subtask as the sample env (existing behaviour).
+    if args.task_dispatch == "group":
+        sample_env_cfg = _build_env_config(args, task_name=env_tasks[0], task_ids=None)
+    else:
+        sample_task_ids = _task_ids_to_eval(args, env_tasks[0])
+        if not sample_task_ids:
+            raise ValueError(f"No task ids resolved for suite '{env_tasks[0]}'.")
+        sample_task_id = sample_task_ids[0]
+        sample_env_cfg = _build_env_config(args, task_name=env_tasks[0], task_ids=(sample_task_id,))
     policy_bundle: PolicyEvalBundle = build_policy_eval_bundle(
         policy_path=args.policy_path,
         critic_state_path=critic_state,
@@ -203,6 +227,7 @@ def main() -> None:
         device=args.device,
         best_of_n=best_of_n,
         n_action_steps=n_action_steps,
+        policy_num_steps=policy_num_steps,
         critic_q_agg_override=args.critic_q_agg_eval,
         use_vlm_backbone_encode=args.use_vlm_backbone_encode,
         use_current_critic=args.use_current_critic,
@@ -210,8 +235,43 @@ def main() -> None:
 
     for env_task in env_tasks:
         logging.info("Evaluating env task: %s", env_task)
-        task_ids = _task_ids_to_eval(args, env_task)
         suite_output_root = output_root / env_task if multi_task else output_root
+
+        if args.task_dispatch == "group":
+            # Single env covering the whole task group — mirrors lerobot-eval BC path.
+            env_cfg = _build_env_config(args, task_name=env_task, task_ids=None)
+            videos_dir = suite_output_root / "videos"
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            info = evaluate_policy_with_best_of_n(
+                policy_path=args.policy_path,
+                critic_state_path=critic_state,
+                env_cfg=env_cfg,
+                n_episodes=args.n_episodes,
+                batch_size=args.eval_batch_size,
+                seed=args.seed,
+                device=args.device,
+                best_of_n=best_of_n,
+                videos_dir=videos_dir,
+                max_render=args.max_render,
+                n_action_steps=n_action_steps,
+                policy_num_steps=policy_num_steps,
+                critic_q_agg_override=args.critic_q_agg_eval,
+                policy_bundle=policy_bundle,
+                use_vlm_backbone_encode=args.use_vlm_backbone_encode,
+            )
+            info["policy_path"] = str(args.policy_path)
+            info["use_best_of_n"] = args.use_best_of_n
+            info["env_task"] = env_task
+            info["task_dispatch"] = "group"
+            if args.use_best_of_n and critic_state is not None:
+                info["critic_state_path"] = str(critic_state)
+            _log_eval_summary(info)
+            _save_eval_info(suite_output_root / "eval_info.json", info)
+            all_infos[env_task] = info
+            continue
+
+        # --- sequential dispatch: existing per-subtask behaviour (unchanged) ---
+        task_ids = _task_ids_to_eval(args, env_task)
         suite_infos: list[dict[str, Any]] = []
 
         for task_id in task_ids:
@@ -232,6 +292,7 @@ def main() -> None:
                 videos_dir=videos_dir,
                 max_render=args.max_render,
                 n_action_steps=n_action_steps,
+                policy_num_steps=policy_num_steps,
                 critic_q_agg_override=args.critic_q_agg_eval,
                 policy_bundle=policy_bundle,
                 use_vlm_backbone_encode=args.use_vlm_backbone_encode,
@@ -241,6 +302,7 @@ def main() -> None:
             info["env_task"] = env_task
             info["task_id"] = task_id
             info["use_vlm_backbone_encode"] = args.use_vlm_backbone_encode
+            info["policy_num_steps"] = policy_num_steps
             if args.use_best_of_n and critic_state is not None:
                 info["critic_state_path"] = str(critic_state)
             _log_eval_summary(info)
@@ -255,6 +317,7 @@ def main() -> None:
                 use_best_of_n=args.use_best_of_n,
                 best_of_n=best_of_n,
                 n_action_steps=n_action_steps,
+                policy_num_steps=policy_num_steps,
                 critic_state=critic_state,
             )
             print(merged)
@@ -271,6 +334,7 @@ def main() -> None:
             use_best_of_n=args.use_best_of_n,
             best_of_n=best_of_n,
             n_action_steps=n_action_steps,
+            policy_num_steps=policy_num_steps,
             critic_state=critic_state,
         )
         _save_eval_info(output_root / "summary.json", summary)
@@ -412,6 +476,7 @@ def _merge_suite_infos(
     use_best_of_n: bool,
     best_of_n: int,
     n_action_steps: int | None,
+    policy_num_steps: int | None,
     critic_state: Path | None,
 ) -> dict[str, Any]:
     drop_keys = {"video_paths", "sum_rewards", "max_rewards"}
@@ -492,6 +557,7 @@ def _merge_suite_infos(
         "use_best_of_n": use_best_of_n,
         "best_of_n": best_of_n,
         "n_action_steps": n_action_steps,
+        "policy_num_steps": policy_num_steps,
         "task_ids": [info.get("task_id") for info in infos if "task_id" in info],
     }
 
@@ -502,7 +568,7 @@ def _merge_suite_infos(
 
 
 def _default_eval_dir(
-    *, use_best_of_n: bool, best_of_n: int, n_action_steps: int | None
+    *, use_best_of_n: bool, best_of_n: int, n_action_steps: int | None, policy_num_steps: int | None
 ) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
     best_of_n_suffix = f"bestofn{best_of_n}"
@@ -511,7 +577,11 @@ def _default_eval_dir(
         policy_suffix = "nstep-unknown"
     else:
         policy_suffix = f"nstep{n_action_steps}"
-    suffixes = [best_of_n_suffix, critic_suffix, policy_suffix]
+    if policy_num_steps is None:
+        denoise_suffix = "denoise-cfg"
+    else:
+        denoise_suffix = f"denoise{policy_num_steps}"
+    suffixes = [best_of_n_suffix, critic_suffix, policy_suffix, denoise_suffix]
     label = "_".join(suffixes)
     return REPO_ROOT / "outputs" / "eval" / f"{stamp}_{label}"
 
@@ -544,6 +614,7 @@ def _build_summary(
     use_best_of_n: bool,
     best_of_n: int,
     n_action_steps: int | None,
+    policy_num_steps: int | None,
     critic_state: Path | None,
 ) -> dict[str, Any]:
     drop_keys = {"video_paths", "sum_rewards", "max_rewards"}
@@ -564,7 +635,7 @@ def _build_summary(
                 for key, value in task_entry.get("metrics", {}).items()
                 if key not in drop_keys
             }
-            # 直接记录每个 task 的成功率
+            # Record the per-task success rate directly.
             success_rate: float | None = None
             if "successes" in metrics and metrics["successes"]:
                 successes = metrics["successes"]
@@ -628,6 +699,7 @@ def _build_summary(
         "use_best_of_n": use_best_of_n,
         "best_of_n": best_of_n,
         "n_action_steps": n_action_steps,
+        "policy_num_steps": policy_num_steps,
     }
 
     if use_best_of_n and critic_state is not None:

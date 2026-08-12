@@ -12,7 +12,6 @@ import math
 from typing import Iterable, Sequence
 
 import torch
-import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 
@@ -190,13 +189,3 @@ def vgps_augment_vmap(
 
 
 __all__ = ["vgps_augment", "vgps_augment_vmap"]
-
-
-if __name__ == "__main__":
-    # Quick smoke test: run augment on random images and print shapes/ranges.
-    torch.manual_seed(0)
-    dummy = torch.rand(2, 3, 256, 256)
-    out = vgps_augment(dummy)
-    out_vmap = vgps_augment_vmap(dummy)
-    print("Loop output shape:", out.shape, "min/max:", float(out.min()), float(out.max()))
-    print("vmap output shape:", out_vmap.shape, "min/max:", float(out_vmap.min()), float(out_vmap.max()))

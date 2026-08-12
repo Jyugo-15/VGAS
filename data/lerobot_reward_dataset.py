@@ -7,11 +7,8 @@ episode-level accessors (`get_episode` / `load_episode`) and surfaces any
 
 from __future__ import annotations
 
-import argparse
 import logging
 from collections import OrderedDict
-from itertools import cycle
-from pathlib import Path
 from typing import Any, Dict, Iterable
 
 import torch
@@ -201,7 +198,7 @@ else:
                 dones = torch.as_tensor(raw_done).to(torch.bool)
             stacked["dones"] = dones
 
-            # 计算从当前时刻到 episode 结束的折扣回报（蒙特卡洛回报）
+            # Discounted return from the current step to the end of the episode (Monte-Carlo return).
             mc_returns = torch.zeros(length, dtype=torch.float32)
             running = torch.zeros(1, dtype=torch.float32)
             for idx in reversed(range(length)):
@@ -376,185 +373,3 @@ else:
             if self.include_future_observation:
                 base_sample["next_observations"] = self._next_observation_snapshot(episode_index, global_start)
             return base_sample
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Smoke-test RewardAugmentedLeRobotDataset.")
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default="",
-        help="Local dataset root (e.g. /path/to/libero_object_with_rewards).",
-    )
-    parser.add_argument(
-        "--repo-id",
-        type=str,
-        default="",
-        help="Optional repo id override (defaults to dataset folder name).",
-    )
-    parser.add_argument(
-        "--episode",
-        type=int,
-        default=0,
-        help="Episode index to inspect when --root is provided.",
-    )
-    parser.add_argument(
-        "--preview",
-        type=int,
-        default=5,
-        help="How many timesteps to print from the sampled episode.",
-    )
-
-    parser.add_argument(
-        "--inspect-loader",
-        default=True,
-        help="Instantiate a DataLoader (mirroring train.py) and print one batch summary.",
-    )
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size for the loader preview.")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for the preview.")
-    parser.add_argument(
-        "--prefetch-factor",
-        type=int,
-        default=2,
-        help="prefetch_factor value when num_workers>0 (matches train.py defaults).",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=5,
-        help="Chunk length for action/reward windows when sampling via DataLoader.",
-    )
-    parser.add_argument(
-        "--pin-memory",
-        action="store_true",
-        help="Enable pin_memory on the preview DataLoader (set this when training on CUDA).",
-    )
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Simulate cfg.dataset.streaming to disable shuffling in the preview loader.",
-    )
-    args = parser.parse_args()
-
-    if args.root is not None:
-        if LeRobotDataset is None:
-            raise ImportError("LeRobotDataset unavailable; install lerobot before loading a real dataset.")
-
-        dataset_root = args.root.expanduser().resolve()
-        repo_id = args.repo_id or dataset_root.name
-        delta = {
-            'observation.images.image': [0.0],
-            'observation.images.image2': [0.0],
-            'observation.state': [0.0],
-            'action': [0.0, 0.1, 0.2, 0.3, 0.4],
-        }
-        ds = RewardAugmentedLeRobotDataset(
-            repo_id=repo_id,
-            root=str(dataset_root),
-            chunk_size=args.chunk_size,
-            download_videos=False,
-            delta_timestamps=delta
-        )
-        episode = ds.get_episode(args.episode)
-        ########################################################
-        step = 141  # 第 143 个时间步（从 0 开始计）
-        sample1 = ds[136]
-        sample2 = ds[137]
-        sample3 = ds[138]
-        sample4 = ds[139]
-        print(sample1["next_observations"]["observation.images.image_is_pad"])
-        print(sample2["next_observations"]["observation.images.image_is_pad"])
-        print(sample3["next_observations"]["observation.images.image_is_pad"])
-        print(sample4["next_observations"]["observation.images.image_is_pad"])
-        diff = (sample1["observation.images.image"] - sample2["observation.images.image"]).abs().max()
-        
-        print("obs:", {k: v[step] for k,v in episode.items() if k.startswith("observation.")})
-        print("actions chunk:", episode["actions"][step])
-        for key, value in episode.items():
-            if hasattr(value, "__getitem__"):
-                # print(key, value[step].shape if hasattr(value[step], "shape") else value[step])
-
-                print(key, value[step])
-
-        ########################################################3
-        length = episode["actions"].shape[0]
-        limit = min(args.preview, length)
-        print("Loaded dataset root:", dataset_root)
-        print("Episode length:", length)
-        print("First {} timesteps actions:\n{}".format(limit, episode["actions"][:limit]))
-        print("First {} rewards:\n{}".format(limit, episode["rewards"][:limit]))
-        print("First {} dones:\n{}".format(limit, episode["dones"][:limit]))
-
-        if args.inspect_loader:
-            sample = ds[0] if len(ds) > 0 else {}
-            has_non_tensor_fields = any(
-                not torch.is_tensor(value) for value in sample.values()
-            )
-            pin_memory = args.pin_memory and not has_non_tensor_fields
-            loader_kwargs = {
-                "dataset": ds,
-                "num_workers": args.num_workers,
-                "batch_size": args.batch_size,
-                "shuffle": not args.streaming,
-                "sampler": None,
-                "pin_memory": pin_memory,
-                "drop_last": False,
-            }
-            if args.num_workers > 0 and args.prefetch_factor is not None:
-                loader_kwargs["prefetch_factor"] = args.prefetch_factor
-            dataloader = torch.utils.data.DataLoader(**loader_kwargs)
-            dl_iter = cycle(dataloader)
-            batch = next(dl_iter)
-
-            def describe(value: Any) -> str:
-                if torch.is_tensor(value):
-                    return f"tensor(shape={tuple(value.shape)}, dtype={value.dtype})"
-                if isinstance(value, list):
-                    return f"list(len={len(value)})"
-                if isinstance(value, tuple):
-                    return f"tuple(len={len(value)})"
-                if isinstance(value, dict):
-                    return f"dict(keys={list(value)})"
-                return f"{type(value).__name__}"
-
-            print("\nDataLoader preview (single batch):")
-            for key, value in batch.items():
-                print(f"  {key}: {describe(value)}")
-
-    else:
-        from types import SimpleNamespace
-
-        class _ToyRewardDataset(RewardAugmentedLeRobotDataset):
-            def __init__(self) -> None:
-                # Bypass parent init for a lightweight, in-memory demo
-                self.reward_key = "reward"
-                self.terminal_key = "terminal"
-                self.action_key = "actions"
-                self._cache_size = 2
-                self._episode_cache = OrderedDict()
-                self.features = {"actions": {}, "reward": {}, "terminal": {}}
-                self.meta = SimpleNamespace(
-                    episodes=[{"dataset_from_index": 0, "dataset_to_index": 4, "length": 4}]
-                )
-                self.hf_dataset = [
-                    {
-                        "actions": torch.tensor([float(i), float(i + 0.5)]),
-                        "reward": torch.tensor(float(i)),
-                        "terminal": torch.tensor(i == 3),
-                    }
-                    for i in range(4)
-                ]
-
-            def __len__(self) -> int:
-                return len(self.hf_dataset)
-
-        if LeRobotDataset is None:
-            print(
-                "LeRobotDataset unavailable; running in-memory demo instead. "
-                "Pass --root=/path/to/dataset once lerobot is installed."
-            )
-        toy_dataset = _ToyRewardDataset()
-        packed_episode = toy_dataset.get_episode(0)
-        print("Demo episode actions:", packed_episode["actions"])
-        print("Demo episode rewards:", packed_episode["rewards"])
-        print("Demo episode dones:", packed_episode["dones"])

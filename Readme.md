@@ -1,125 +1,203 @@
-# VGAS (Value-Guided Action-Chunk Selection)
+# VGAS: Value-Guided Action-Chunk Selection and Refinement for Few-Shot VLA Adaptation
 
-This repository contains the code for **VGAS**, a generation--selection framework for few-shot Vision-Language-Action (VLA) adaptation. VGAS combines a high-recall VLA policy for action-chunk proposal with a geometrically grounded Transformer critic (**Q-Chunk-Former**) and **Explicit Geometric Regularization (EGR)** to improve ranking resolution under limited supervision.
+[![arXiv](https://img.shields.io/badge/arXiv-2602.07399-b31b1b.svg)](https://arxiv.org/abs/2602.07399)
+[![Project Page](https://img.shields.io/badge/Project-Page-1f6feb.svg)](https://jyugo-15.github.io/VGAS/)
+[![Model](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Checkpoints-ffce3a.svg)](https://huggingface.co/SemyonXu616/VGAS-5-shot)
+[![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-5--shot%20LIBERO-ffce3a.svg)](https://huggingface.co/datasets/SemyonXu616/HF_LIBERO_5_SHOT)
 
-## Method ↔ Code Map
+Official implementation of **VGAS** and **VGAS+**, a generation–selection
+framework for few-shot Vision-Language-Action (VLA) adaptation.
 
-- **VGAS (generation--selection / Best-of-N)**: `scripts/eval_qc_bestofn.py`, `smolvla_qchunk/eval/bestofn_eval.py`, `qchunk/vgas_policy.py`
-- **Q-Chunk-Former critic**: `qchunk/valuequeryhead.py`, `qchunk/qchunked_critic.py`
-- **EGR (explicit geometric regularization)**: `qchunk/ood_calql_utils.py`, `qchunk/qchunked_critic.py`
-- **Training pipeline**: `scripts/run_qchunk_offline.py`, `scripts/train_qchunk_offline.py`
-- **Data utilities**: `data/README.md`
+Under scarce demonstrations, a fine-tuned VLA policy generally produces semantically plausible
+action chunks, but small geometric errors can flip the execution outcome from success to failure.
+We address this by learning a long-horizon critic over temporally extended action chunks:
 
-## Environment
+- **Q-Chunk-Former** — a geometrically grounded Transformer critic that maps vision–language
+  observations and proprioceptive state to chunk-level values.
+- **Explicit Geometric Regularization (EGR)** — injects dense geometric supervision around expert
+  demonstrations to preserve fine-grained value discrimination among near-miss action chunks.
+- **VGAS** — keeps the SFT policy fixed and performs inference-time **Best-of-N**
+  selection, executing the highest-value candidate chunk.
+- **VGAS+** — a post-training **policy extraction** step: candidate chunks are
+  optimized in action space under the critic, then distilled back into the VLA through its native
+  supervised generative objective, so the refined policy generates high-value chunks directly
+  (no inference-time reranking).
 
-- Python and CUDA setup are assumed.
-- Install dependencies:
+Experiments are on the **LIBERO** and **MetaWorld** benchmarks with a **SmolVLA** policy.
+
+---
+
+## Installation
 
 ```bash
-conda create -n VGAS python=3.10 -y
-conda activate VGAS
+# 1) Python environment
+conda create -n VGAS python=3.10 -y && conda activate VGAS
 pip install -r requirements.txt
 
+# 2) LIBERO benchmark (from source)
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-cd LIBERO
-pip install -e .
+cd LIBERO && pip install -e . && cd ..
+
+# 3) MetaWorld / MuJoCo are pulled in by requirements.txt (mujoco, robosuite).
+#    For headless rendering the scripts default to EGL (MUJOCO_GL=egl).
 ```
 
-The provided shell scripts assume a conda environment named `VGAS`. Adjust the scripts if your environment differs.
+Key dependencies: `torch 2.7.1` (CUDA 12), `transformers==4.57.0`, `peft==0.17.1`,
+`lerobot==0.4.0`, `robosuite==1.4.1`, `mujoco==3.3.6`.
 
-## Data
+The shell scripts assume the conda env is named `VGAS` and that `conda` / `lerobot` are on `PATH`.
+Set `CONDA_BASE`, `LIBERO_ROOT`, `CUDA_VISIBLE_DEVICES`, etc. via environment variables to match
+your machine — every script reads them with sensible defaults.
 
-The pipeline targets LIBERO/LeRobot-style datasets. See `data/README.md` for dataset preparation and reward annotation utilities. Update dataset paths in the shell scripts and/or command-line arguments to match your local setup.
+---
 
-For critic ranking diagnostics, you can optionally provide a separate dataset root with `--eval-ranking-full-dataset-root`. This path is used only for offline ranking eval and is not required for training.
+## Pretrained checkpoints & datasets
 
-Our `separate dataset` is not from a different source. It is re-split from the original full LIBERO dataset:
+We release the SFT base policy, all four VGAS critics, all four VGAS+ policies, and the
+5-shot LIBERO split on Hugging Face:
 
-- The original full LIBERO dataset contains tasks from four suites.
-- We reorganize it into four suite-specific subsets: `libero_object`, `libero_goal`, `libero_spatial`, and `libero_10`.
-- `--dataset-root` is your training root.
-- `--eval-ranking-full-dataset-root` is an optional offline ranking-eval reference root, typically pointing to the suite-split dataset derived from the same full LIBERO source.
+- Checkpoints: [`SemyonXu616/VGAS-5-shot`](https://huggingface.co/SemyonXu616/VGAS-5-shot)
+- 5-shot LIBERO dataset: [`SemyonXu616/HF_LIBERO_5_SHOT`](https://huggingface.co/datasets/SemyonXu616/HF_LIBERO_5_SHOT)
 
-## Training (Critic / Q-Chunk-Former)
+Checkpoint layout:
 
-Example entry point:
+```text
+smolvla/5_SHOT/pretrained_model/       # Shared 5-shot SmolVLA policy
+{suite}/vgas_critic/last.ckpt          # VGAS inference-time critic
+{suite}/vgas_plus/pretrained_model/    # Distilled VGAS+ policy
+```
+
+`{suite}` is one of `goal`, `object`, `spatial`, or `long` (`long` corresponds to
+`libero_10`). The released VGAS+ policies are available at:
+
+| LIBERO suite | VGAS+ checkpoint |
+|---|---|
+| Goal | [`goal/vgas_plus/pretrained_model`](https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main/goal/vgas_plus/pretrained_model) |
+| Object | [`object/vgas_plus/pretrained_model`](https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main/object/vgas_plus/pretrained_model) |
+| Spatial | [`spatial/vgas_plus/pretrained_model`](https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main/spatial/vgas_plus/pretrained_model) |
+| Long (`libero_10`) | [`long/vgas_plus/pretrained_model`](https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main/long/vgas_plus/pretrained_model) |
+
+Download the checkpoints and the prepared LIBERO split directly into the paths expected by the
+provided launchers:
 
 ```bash
-python scripts/run_qchunk_offline.py \
-  --policy-path <PRETRAINED_POLICY_DIR> \
-  --dataset-root <DATASET_ROOT> \
-  --dataset-repo-id libero_goal \
-  --chunk-size 32 \
-  --q-chunk-len 32 \
-  --critic-type q_chunk_former \
-  --use-ood-reg true \
-  --loss-rank-weight 5.0
+hf download SemyonXu616/VGAS-5-shot \
+  --local-dir pretrained_vla/Libero
+hf download SemyonXu616/HF_LIBERO_5_SHOT \
+  --repo-type dataset \
+  --local-dir dataset/Libero/HF_LIBERO_5_SHOT
 ```
 
-For a full configuration example, see `run_scrpit/train_goal.sh`.
+VGAS and VGAS+ start from the **fine-tuned SFT policy** — you do not need to re-run base SFT.
 
-## Offline Ranking Eval (Critic Diagnostics)
+---
 
-`scripts/train_qchunk_offline.py` includes an offline critic ranking eval loop. This is a critic diagnostic during training, not an online rollout success-rate evaluation.
+## Data preparation
 
-- Enable with `--eval-ranking-freq > 0`.
-- `rank_eval/train/*` metrics are computed from the training dataset root (`--dataset-root`).
-- `rank_eval/full/*` metrics are computed from `--eval-ranking-full-dataset-root` when provided.
-- In this repo, `full` usually means a broader reference split from the same LIBERO source, not a different benchmark domain.
-- If `--eval-ranking-full-dataset-root` is missing/invalid, or full-data ranking eval raises an exception, full-data eval is skipped and disabled for the rest of the run while training continues.
+Both benchmarks share the same reward-annotated few-shot pipeline (5 demonstrations per task).
 
-## Evaluation (BC vs Best-of-N)
-
-BC (no critic guidance):
+**LIBERO** (see `data/libero/README.md` for all options):
 
 ```bash
-python scripts/eval_qc_bestofn.py \
-  --env-task libero_goal \
-  --policy-path <PRETRAINED_POLICY_DIR> \
-  --no-use-best-of-n \
-  --best-of-n 1
+bash data/libero/hflibero_fewshot_dataset_pipeline.sh
 ```
 
-Best-of-N (critic-guided):
+**MetaWorld** (see `data/metaworld/README.md`):
 
 ```bash
-python scripts/eval_qc_bestofn.py \
-  --env-task libero_goal \
-  --policy-path <PRETRAINED_POLICY_DIR> \
-  --critic-state <CRITIC_CKPT> \
-  --use-best-of-n \
-  --best-of-n 8
+bash data/metaworld/metaworld_fewshot_dataset_pipeline.sh
 ```
 
-## Reproducing Experiments
+---
 
-Our experiment results can be reproduced by running `run_scrpit/test_bc.sh` (BC) and `run_scrpit/test_vgas.sh` (VGAS). (Libero goal as an example)
+## Training
 
-The fine-tuned 5-shot SmolVLA and trained critic checkpoints are available at:
-https://huggingface.co/SemyonXu616/VGAS-5-shot/tree/main
+All runs start from the released SFT policy. VGAS keeps the SFT policy frozen and trains the
+**Q-Chunk-Former critic** with the `TD + EGR` objective; VGAS+ additionally
+distills critic-optimized chunks back into the policy.
+Both methods use `scripts/run_qchunk_offline.py`: VGAS is the default, while `--distill`
+enables the two-stage VGAS+ pipeline (critic-only warmup, then critic training plus policy distillation).
+Script defaults reproduce the paper configuration (LIBERO example: `libero_goal`;
+MetaWorld example: `very_hard`).
 
-The few-shot (5-shot) dataset can be generated with `data/hflibero_fewshot_dataset_pipeline.sh`; see `data/README.md` for details. We also released the dataset used in our experiments on Hugging Face: https://huggingface.co/datasets/SemyonXu616/HF_LIBERO_5_SHOT/tree/main.
+**VGAS critic (LIBERO, used for Best-of-N):**
 
-The full/split LIBERO dataset used for offline ranking eval is available at:
-`<HF_LINK_PLACEHOLDER>`
+```bash
+bash run_scripts/libero/train_goal.sh
+```
 
-## TODO
+**VGAS+ policy extraction (LIBERO)** — pick a suite with `DATASET_NAME`:
 
-- Add additional benchmarks (e.g., MetaWorld).
-- Support alternative policy classes (e.g., diffusion-based policies).
+```bash
+DATASET_NAME=libero_goal bash run_scripts/libero/train_distill.sh
+```
 
-## Notes
+**VGAS+ policy extraction (MetaWorld)** — pick a difficulty group with `TASK_SPLIT`:
 
+```bash
+TASK_SPLIT=very_hard bash run_scripts/metaworld/train_vgas_distill_metaworld.sh
+```
 
-- Adjust paths, GPU IDs, and seeds in the scripts to fit your local environment.
+---
+
+## Evaluation
+
+**LIBERO**
+
+```bash
+# BC baseline (fixed SFT policy, no critic)
+bash run_scripts/libero/test_bc.sh
+
+# VGAS on LIBERO-Goal: base policy + critic, inference-time Best-of-N
+MODE=vgas \
+POLICY_PATH=pretrained_vla/Libero/smolvla/5_SHOT/pretrained_model \
+CRITIC_PATH=pretrained_vla/Libero/goal/vgas_critic/last.ckpt \
+bash run_scripts/libero/test_vgas.sh
+
+# VGAS+ on LIBERO-Goal: distilled policy, no critic or reranking
+MODE=vgas_plus \
+POLICY_PATH=pretrained_vla/Libero/goal/vgas_plus/pretrained_model \
+bash run_scripts/libero/test_vgas.sh
+```
+
+Set `ENV_TASK` and the checkpoint suite together for other evaluations: `libero_object` ↔ `object`,
+`libero_spatial` ↔ `spatial`, and `libero_10` ↔ `long`.
+
+**MetaWorld**
+
+```bash
+# BC baseline
+bash run_scripts/metaworld/eval_metaworld_bc.sh
+
+# VGAS+: the distilled policy (point CKPT_ROOT_REL at your VGAS+ checkpoints)
+bash run_scripts/metaworld/eval_metaworld_vgas_plus.sh
+```
+
+`run_scripts/metaworld/summarize_success_rate.py` aggregates per-group success rates from the
+evaluation outputs.
+
+---
 
 ## Citation
+
 If you find this work useful, please cite:
 
 ```bibtex
 @article{xu2026vgas,
-  title  = {VGAS: Value-Guided Action-Chunk Selection for Few-Shot Vision-Language-Action Adaptation},
-  author = {Xu, Changhua and Lu, Jie and Xuan, Junyu and Yu, En},
-  journal= {arXiv preprint arXiv:2602.07399},
-  year   = {2026}
+  title   = {VGAS: Value-Guided Action-Chunk Selection for Few-Shot Vision-Language-Action Adaptation},
+  author  = {Xu, Changhua and Yu, En and Xuan, Junyu and Lu, Jie},
+  journal = {arXiv preprint arXiv:2602.07399},
+  year    = {2026}
 }
+
+% VGAS+ — preprint coming soon.
+% The citation entry will be added here once it is online.
+```
+
+## Acknowledgments
+
+This project builds on [SmolVLA](https://github.com/huggingface/lerobot) and the
+[LeRobot](https://github.com/huggingface/lerobot) framework, and evaluates on the
+[LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) and
+[MetaWorld](https://github.com/Farama-Foundation/Metaworld) benchmarks. We thank the authors of
+these projects for open-sourcing their work.

@@ -70,13 +70,14 @@ class SmolVLMWithExpertModel(nn.Module):
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
+        device: str = "auto",
     ):
         super().__init__()
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                device_map="auto",
+                device_map=device,
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
             )
@@ -102,9 +103,8 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
-        
+
         self.num_expert_layers = len(self.lm_expert.layers)
-        print("self.num_expert_layers", self.num_expert_layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
         if "cross" in attention_mode:
             # Reshape qkv projections to have the same input dimension as the vlm
